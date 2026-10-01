@@ -308,12 +308,26 @@ def _make_sttm_tools(
     business_intent: str | None,
     run_id: str,
     scratchpad: dict,
+    task_description: str = "",
 ):
     """Build all four STTM tools bound to the caller's context via closure.
 
     Only the context relevant to the requested layer will be populated; the
     others will be None and the agent should not call those generation tools.
+
+    ``task_description`` carries the orchestrator's goal message, which may
+    include user feedback from a "What's wrong?" regeneration request. It is
+    appended directly to each generation tool's inner LLM prompt rather than
+    relying on the outer agent to relay it -- the outer agent only decides
+    *which* tool to call, so any instruction living solely in its own input
+    would otherwise never reach the inner call that actually writes the rows.
     """
+    feedback_block = (
+        f"\nAdditional instructions from the caller (apply these; they may "
+        f"include user feedback on a previous attempt -- override any "
+        f"conflicting default above):\n{task_description.strip()}\n"
+        if task_description and task_description.strip() else ""
+    )
 
     @tool
     def inspect_context_tool(confirmation: str = "execute") -> str:
@@ -367,6 +381,7 @@ def _make_sttm_tools(
             "source_schema, source_table, source_column, target_schema, target_table, "
             "target_column, transformation_type, transformation_logic. "
             "No markdown fences, no prose."
+            f"{feedback_block}"
         )
         rows = _generate_sttm_rows_via_llm(inner_prompt)
         if not rows:
@@ -423,6 +438,7 @@ def _make_sttm_tools(
             "- Each row must include these fields: source_schema, source_table, source_column, target_schema, target_table, target_column, transformation_type, transformation_logic.\n"
             "- Do NOT include markdown fences, prose, or any function/tool-call-like syntax.\n"
             "- Do NOT include run_id, file paths, or other metadata in the JSON rows.\n"
+            f"{feedback_block}"
         )
         rows = _generate_sttm_rows_via_llm(inner_prompt)
         if not rows:
@@ -474,6 +490,7 @@ def _make_sttm_tools(
             "- If the business intent implies an aggregation (sum, total, avg), include the base numeric column(s) required to compute that aggregation.\n"
             "- If multiple Silver tables are relevant, include join rules (source_table, source_column -> target_table, target_column) as STTM rows so the Reporter can join tables.\n"
             "- Prefer completeness for intent-serving columns: include them even if you think they may be redundant.\n"
+            f"{feedback_block}"
         )
         rows = _generate_sttm_rows_via_llm(inner_prompt)
         if not rows:
@@ -576,6 +593,7 @@ def generate_bronze_sttm(
         business_intent=None,
         run_id=run_id,
         scratchpad=scratchpad,
+        task_description=task_description,
     ))
     return _run_sttm_agent(
         trace_name="sttm_bronze",
@@ -619,6 +637,7 @@ def generate_silver_sttm(
         business_intent=None,
         run_id=run_id,
         scratchpad=scratchpad,
+        task_description=task_description,
     ))
     return _run_sttm_agent(
         trace_name="sttm_silver",
@@ -662,6 +681,7 @@ def generate_gold_sttm(
         business_intent=business_intent,
         run_id=run_id,
         scratchpad=scratchpad,
+        task_description=task_description,
     ))
     return _run_sttm_agent(
         trace_name="sttm_gold",

@@ -31,8 +31,8 @@ TRACES_DIR = DATA_DIR / "traces"
 # LLM Configuration
 LLM_PROVIDER = "groq"
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = "openai/gpt-oss-20b"  # Currently supported Groq model
-#"openai/gpt-oss-120b"
+GROQ_MODEL = "openai/gpt-oss-120b"  # Currently supported Groq model
+#"openai/gpt-oss-20b"
 
 # Ensure directories exist
 for d in [LANDING_DIR, PROFILES_DIR, STTM_DIR, BRONZE_DIR, SILVER_DIR, GOLD_DIR, REPORTS_DIR, AUDIT_DIR, CHROMA_DIR, TRACES_DIR]:
