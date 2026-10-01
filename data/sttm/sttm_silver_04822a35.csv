@@ -1,0 +1,20 @@
+source_schema,source_table,source_column,target_schema,target_table,target_column,transformation_type,transformation_logic
+location_bronze,location_bronze,,location_silver,location_silver,pk_location_silver_id,Indirect,Auto-generated sequential surrogate primary key starting from 1
+location_bronze,location_bronze,source_record_id,location_silver,location_silver,source_record_id,Direct,Cast to integer; Deduplicate
+location_bronze,location_bronze,location_id,location_silver,location_silver,location_id,Direct,Cast to integer
+location_bronze,location_bronze,location_name,location_silver,location_silver,location_name,Direct,Passthrough; Strip whitespace; Title case
+location_bronze,location_bronze,legacy_type,location_silver,location_silver,legacy_type,Direct,Passthrough; Uppercase; Strip whitespace
+location_bronze,location_bronze,address_line1,location_silver,location_silver,address_line1,Direct,Passthrough; Strip whitespace
+location_bronze,location_bronze,city,location_silver,location_silver,city,Direct,Passthrough; Lowercase; Strip whitespace
+location_bronze,location_bronze,state,location_silver,location_silver,state,Direct,Passthrough; Uppercase; Strip whitespace
+location_bronze,location_bronze,postal_code,location_silver,location_silver,postal_code,Direct,Passthrough; Uppercase; Strip whitespace
+location_bronze,location_bronze,country,location_silver,location_silver,country,Direct,Passthrough; Uppercase; Strip whitespace
+location_bronze,location_bronze,phone,location_silver,location_silver,phone,Direct,Passthrough; Strip whitespace
+location_bronze,location_bronze,is_active,location_silver,location_silver,is_active,Direct,Passthrough
+location_bronze,location_bronze,created_date,location_silver,location_silver,created_date,Direct,Cast to text; Strip whitespace
+location_bronze,location_bronze,last_modified_date,location_silver,location_silver,last_modified_date,Direct,Cast to text; Strip whitespace
+location_bronze,location_bronze,source_system,location_silver,location_silver,source_system,Direct,Passthrough; Strip whitespace
+location_bronze,location_bronze,batch_id,location_silver,location_silver,batch_id,Direct,Passthrough; Strip whitespace
+location_bronze,location_bronze,load_timestamp,location_silver,location_silver,load_timestamp,Direct,Cast to text; Strip whitespace
+location_bronze,location_bronze,_load_timestamp,location_silver,location_silver,_load_timestamp,Direct,Cast to text; Strip whitespace
+location_bronze,location_bronze,_source_file,location_silver,location_silver,_source_file,Direct,Passthrough; Strip whitespace

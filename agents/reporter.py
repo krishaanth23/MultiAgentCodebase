@@ -358,7 +358,6 @@ def generate_report(
         )
     except Exception as e:
         trace.fail(str(e))
-        conn.close()
         raise
     finally:
         conn.close()

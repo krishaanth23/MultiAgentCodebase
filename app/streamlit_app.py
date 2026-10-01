@@ -825,14 +825,13 @@ with main_col:
 
             col1, col2 = st.columns([1, 1])
             with col1:
-                if st.button("📥 Download Report"):
-                    with open(report_path, "rb") as f:
-                        st.download_button(
-                            label="Download HTML Report",
-                            data=f.read(),
-                            file_name="report.html",
-                            mime="text/html"
-                        )
+                with open(report_path, "rb") as f:
+                    st.download_button(
+                        label="Download HTML Report",
+                        data=f.read(),
+                        file_name="report.html",
+                        mime="text/html"
+                    )
 
             with col2:
                 if st.button("🔄 Start New Analysis"):

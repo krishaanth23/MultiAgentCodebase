@@ -36,7 +36,7 @@ def _mock_reporter_agent(gold_parquet_path: str, analysis: dict = ANALYSIS_JSON)
         mock_agent = MagicMock()
 
         def invoke(inputs):
-            load_tool, query_tool = tools[0], tools[1]
+            load_tool, query_tool = tools[1], tools[2]
             messages = [
                 MagicMock(content=load_tool.invoke({})),
                 MagicMock(content=query_tool.invoke({"sql_query": f"SELECT * FROM {table_stem}"})),

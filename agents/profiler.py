@@ -69,9 +69,8 @@ Return ONLY a valid JSON object — no markdown fences, no prose:
     }
   ],
   "quality_notes": ["observation 1", "observation 2"]
-}"""
-
-""" IMPORTANT: This final answer must be plain assistant text content, NOT a tool call or
+}
+IMPORTANT: This final answer must be plain assistant text content, NOT a tool call or
 function call. Do not invoke any tool (including one named "json") to produce it — after
 calling profiler_tool you are done with tools; just write the JSON directly as your
 message text. """

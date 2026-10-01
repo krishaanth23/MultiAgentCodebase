@@ -1,0 +1,20 @@
+source_schema,source_table,source_column,target_schema,target_table,target_column,transformation_type,transformation_logic
+,,,gold,location_gold,pk_gold_id,Indirect,Auto-generated sequential surrogate primary key starting from 1
+silver,location_silver,source_record_id,gold,location_gold,source_record_id,Passthrough,Passthrough
+silver,location_silver,location_id,gold,location_gold,location_id,Passthrough,Passthrough
+silver,location_silver,location_name,gold,location_gold,location_name,Passthrough,Passthrough
+silver,location_silver,legacy_type,gold,location_gold,legacy_type,Passthrough,Passthrough
+silver,location_silver,address_line1,gold,location_gold,address_line1,Passthrough,Passthrough
+silver,location_silver,city,gold,location_gold,city,Passthrough,Passthrough
+silver,location_silver,state,gold,location_gold,state,Passthrough,Passthrough
+silver,location_silver,postal_code,gold,location_gold,postal_code,Passthrough,Passthrough
+silver,location_silver,country,gold,location_gold,country,Passthrough,Passthrough
+silver,location_silver,phone,gold,location_gold,phone,Passthrough,Passthrough
+silver,location_silver,is_active,gold,location_gold,status_code,Derived,CASE WHEN is_active = 'Y' THEN 1 WHEN is_active = 'N' THEN 0 ELSE NULL END
+silver,location_silver,created_date,gold,location_gold,created_date,Passthrough,Passthrough
+silver,location_silver,last_modified_date,gold,location_gold,last_modified_date,Passthrough,Passthrough
+silver,location_silver,source_system,gold,location_gold,source_system,Passthrough,Passthrough
+silver,location_silver,batch_id,gold,location_gold,batch_id,Passthrough,Passthrough
+silver,location_silver,load_timestamp,gold,location_gold,load_timestamp,Passthrough,Passthrough
+silver,location_silver,_load_timestamp,gold,location_gold,_load_timestamp,Passthrough,Passthrough
+silver,location_silver,_source_file,gold,location_gold,_source_file,Passthrough,Passthrough
