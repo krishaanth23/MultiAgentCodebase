@@ -11,13 +11,12 @@ I/O contract (UNCHANGED — UI and orchestrator safe):
 
 import json
 import os
-from types import SimpleNamespace
 import pandas as pd
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
 from core.config import PROFILES_DIR, LLM_PROVIDER
-from core.llm import make_llm
+from core.llm import make_llm, invoke_agent_with_tool_recovery
 from core.audit import AuditLogger
 from core.observability import AgentTrace
 
@@ -175,34 +174,6 @@ def _make_profiler_tools(file_paths: list[str], run_id: str):
 # Public entry points — I/O contract UNCHANGED
 # ---------------------------------------------------------------------------
 
-def _invoke_agent_with_json_tool_recovery(agent, messages_input: dict) -> dict:
-    """Invoke the agent, recovering from a Groq-specific phantom tool call.
-
-    Some Groq-hosted models (observed with openai/gpt-oss-*) occasionally emit a
-    tool call named "json"/"JSON" instead of writing their final JSON answer as
-    plain text, even when explicitly instructed not to. Groq rejects that call
-    with a 400 and echoes the intended payload back in `failed_generation` — the
-    content is correct, it's just mis-wrapped as a disallowed tool call. Recover
-    it rather than letting the whole phase fail.
-    """
-    try:
-        return agent.invoke(messages_input)
-    except Exception as e:
-        body = getattr(e, "body", None)
-        if not isinstance(body, dict):
-            raise
-        error = body.get("error", {})
-        if error.get("code") != "tool_use_failed":
-            raise
-        try:
-            recovered = json.loads(error.get("failed_generation", ""))
-            arguments = recovered["arguments"]
-        except (json.JSONDecodeError, KeyError, TypeError):
-            raise
-        print("[PROFILER] Recovered final answer from a rejected phantom tool call")
-        return {"messages": [SimpleNamespace(content=json.dumps(arguments))]}
-
-
 def profile_dataset(file_path: str, run_id: str, task_description: str) -> str:
     """Profile a single CSV file. Delegates to profile_multiple_datasets."""
     return profile_multiple_datasets([file_path], run_id, task_description)
@@ -233,8 +204,8 @@ def profile_multiple_datasets(file_paths: list[str], run_id: str, task_descripti
     agent = create_agent(llm, [inspect_tool, stats_tool], system_prompt=PROFILER_AGENT_PROMPT)
 
     try:
-        result = _invoke_agent_with_json_tool_recovery(
-            agent, {"messages": [HumanMessage(content=task_description)]}
+        result = invoke_agent_with_tool_recovery(
+            agent, {"messages": [HumanMessage(content=task_description)]}, [inspect_tool, stats_tool]
         )
     except Exception as e:
         trace.fail(str(e))

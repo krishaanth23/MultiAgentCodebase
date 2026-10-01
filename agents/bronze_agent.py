@@ -16,7 +16,7 @@ from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
 from core.config import BRONZE_DIR, LLM_PROVIDER
-from core.llm import make_llm
+from core.llm import make_llm, invoke_agent_with_tool_recovery
 from core.audit import AuditLogger
 from agents.sttm_generator import BRONZE_LOGIC_TAGS, parse_logic_tags
 from core.observability import AgentTrace
@@ -30,17 +30,17 @@ execute it, and verify your output.
 ## Your operating mode — follow this EXACT sequence every time
 
 1. THINK: Read the task. Identify the input files, the STTM path, and what the
-   Bronze layer is expected to produce (Parquet files with renamed columns, type
-   casts, and lineage metadata).
+   Bronze layer is expected to produce (Parquet files with renamed columns and
+   lineage metadata -- a faithful, untransformed copy of the source data).
 
 2. INSPECT: Call inspect_task_tool FIRST. This previews the CSV file shapes,
    column names, and the STTM transformation rules that will be applied.
-   State your observations: which columns will be renamed, which will be type-cast,
-   which metadata columns will be injected.
+   State your observations: which columns will be renamed, which metadata
+   columns will be injected. Bronze never casts or transforms values.
 
 3. PLAN: Based on the inspection output, write your explicit ingestion plan:
    - For each input file, which rules apply?
-   - What transformations will each column undergo?
+   - Which columns (if any) will be renamed?
    - What metadata columns (_load_timestamp, _source_file) will be added?
 
 4. ACT: Call bronze_ingestion_tool to execute the full ingestion workflow across
@@ -56,8 +56,9 @@ execute it, and verify your output.
   Call this FIRST to form your ingestion plan. Returns a JSON summary.
 
 - **bronze_ingestion_tool**: Executes the full Bronze layer ingestion workflow.
-  Reads each raw CSV, applies approved STTM rules (column renaming, type casting,
-  metadata injection), and writes Bronze Parquet artifacts to the Bronze layer.
+  Reads each raw CSV, applies approved STTM rules (column renaming and metadata
+  injection only -- no type casting, Bronze is a faithful raw copy), and writes
+  Bronze Parquet artifacts to the Bronze layer.
   Returns a JSON list of output file paths.
 
 ## Output
@@ -103,7 +104,7 @@ def _inspect_task(input_files: list[str], sttm_path: str) -> dict:
 
 
 def _apply_bronze_rules(input_files: list[str], sttm_path: str, run_id: str) -> list[str]:
-    """Read each input CSV, apply STTM rename/type/metadata rules, write Bronze Parquet."""
+    """Read each input CSV, apply STTM rename/metadata rules, write Bronze Parquet."""
     audit = AuditLogger(run_id)
     audit.log("bronze_agent", "started", input_files=input_files, sttm_path=sttm_path)
 
@@ -111,7 +112,11 @@ def _apply_bronze_rules(input_files: list[str], sttm_path: str, run_id: str) -> 
     output_paths = []
 
     for file_path in input_files:
-        df = pd.read_csv(file_path)
+        # dtype=str: Bronze is a faithful raw copy -- without this, pandas' own CSV
+        # parser silently reinterprets values (e.g. a zero-padded ID '001' becomes
+        # the integer 1) before the STTM rules are ever consulted. Any real typing
+        # is Silver's job.
+        df = pd.read_csv(file_path, dtype=str)
         original_shape = df.shape
         file_name = os.path.basename(file_path)
         file_stem = os.path.splitext(file_name)[0]
@@ -139,22 +144,13 @@ def _apply_bronze_rules(input_files: list[str], sttm_path: str, run_id: str) -> 
             if not working_col or working_col not in df.columns:
                 continue
 
+            # Bronze never casts or transforms values -- only renaming (handled above)
+            # and metadata injection happen here. Anything else in transformation_logic
+            # is a no-op; just flag it so a bad STTM row doesn't fail silently.
             tags = parse_logic_tags(logic)
             if tags and not (tags & BRONZE_LOGIC_TAGS):
                 print(f"[BRONZE] Unrecognised transformation_logic {logic!r} for column "
                       f"'{working_col}' -- treating as passthrough.")
-
-            try:
-                if "cast to text" in tags:
-                    df[working_col] = df[working_col].astype(str)
-                elif "cast to integer" in tags:
-                    df[working_col] = pd.to_numeric(df[working_col], errors="coerce").astype("Int64")
-                elif "cast to float" in tags:
-                    df[working_col] = pd.to_numeric(df[working_col], errors="coerce")
-                elif "cast to date" in tags:
-                    df[working_col] = pd.to_datetime(df[working_col], errors="coerce")
-            except (ValueError, TypeError):
-                pass
 
         if "_load_timestamp" not in df.columns and "load_timestamp" not in df.columns:
             df["_load_timestamp"] = datetime.now(timezone.utc).isoformat()
@@ -244,7 +240,9 @@ def execute_bronze(
     agent = create_agent(llm, [inspect_tool, ingestion_tool], system_prompt=BRONZE_AGENT_PROMPT)
 
     try:
-        result = agent.invoke({"messages": [HumanMessage(content=task_description)]})
+        result = invoke_agent_with_tool_recovery(
+            agent, {"messages": [HumanMessage(content=task_description)]}, [inspect_tool, ingestion_tool]
+        )
     except Exception as e:
         trace.fail(str(e))
         raise

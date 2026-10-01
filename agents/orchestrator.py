@@ -60,7 +60,7 @@ from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
 from core.audit import AuditLogger
-from core.llm import make_llm
+from core.llm import make_llm, invoke_agent_with_tool_recovery
 from core.memory import store_document
 from core.observability import AgentTrace
 from agents.profiler import profile_multiple_datasets
@@ -271,7 +271,9 @@ def _run_supervisor(
     print(f"[ORCHESTRATOR] Goal: {phase_goal[:200]}")
 
     try:
-        result = agent.invoke({"messages": [HumanMessage(content=phase_goal)]})
+        result = invoke_agent_with_tool_recovery(
+            agent, {"messages": [HumanMessage(content=phase_goal)]}, tools
+        )
     except Exception as e:
         trace.fail(str(e))
         raise

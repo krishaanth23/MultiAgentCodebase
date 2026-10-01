@@ -27,7 +27,7 @@ from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
 from core.config import STTM_DIR
-from core.llm import make_llm
+from core.llm import make_llm, invoke_agent_with_tool_recovery
 from core.audit import AuditLogger
 from core.observability import AgentTrace
 
@@ -87,12 +87,14 @@ which STTM generation tool is appropriate, execute it, and verify the output.
 ## STTM rules by layer — apply these exactly
 
 ### Bronze
-- "Direct" for pass-through columns, "Indirect" for renamed/type-validated columns.
+- "Direct" for pass-through columns, "Indirect" for renamed columns.
 - Add metadata rows: _load_timestamp ("Current UTC timestamp injected at load time")
   and _source_file ("Source file path injected at load time").
 - Do NOT add a surrogate key — that belongs in Silver.
-- Data-column transformation_logic: exactly one or more of Passthrough, Cast to
-  text, Cast to integer, Cast to float, Cast to date (combine with "; ").
+- Bronze NEVER casts or transforms values — it is a faithful raw copy.
+  Data-column transformation_logic is always exactly "Passthrough" (a renamed
+  column is still Passthrough; the rename is carried by source_column/target_column
+  differing, not by transformation_logic).
 - Each row: source_schema, source_table, source_column, target_schema, target_table,
   target_column, transformation_type, transformation_logic.
 
@@ -149,7 +151,7 @@ which STTM generation tool is appropriate, execute it, and verify the output.
 # can never drift apart.
 
 BRONZE_LOGIC_TAGS = frozenset({
-    "passthrough", "rename", "cast to text", "cast to integer", "cast to float", "cast to date",
+    "passthrough", "rename",
 })
 
 SILVER_LOGIC_TAGS = frozenset({
@@ -326,9 +328,11 @@ def _make_sttm_tools(
             f"Profile context:\n{context_tool_result[:6000]}\n\n"
             "Bronze is intent-agnostic: cover EVERY source column mechanically — "
             "do not filter, prioritise, or omit any column based on perceived relevance.\n"
-            "For each data-column row's transformation_logic, use ONLY one of these exact "
-            "phrases (combine more than one on a row with '; '): Passthrough, Cast to text, "
-            "Cast to integer, Cast to float, Cast to date. Do not write free-form descriptions.\n"
+            "Bronze NEVER casts or transforms values -- it is a faithful raw copy. "
+            "Every data-column row's transformation_logic must be exactly 'Passthrough' "
+            "(even for a renamed column -- the rename is carried by source_column/"
+            "target_column differing, not by transformation_logic). Do not write free-form "
+            "descriptions and do not invent cast/type phrases.\n"
             "Return ONLY a valid JSON array of STTM rows. Each row must have: "
             "source_schema, source_table, source_column, target_schema, target_table, "
             "target_column, transformation_type, transformation_logic. "
@@ -516,7 +520,9 @@ def _run_sttm_agent(
     agent = create_agent(llm, tools, system_prompt=STTM_AGENT_PROMPT)
 
     try:
-        result = agent.invoke({"messages": [HumanMessage(content=task_description)]})
+        result = invoke_agent_with_tool_recovery(
+            agent, {"messages": [HumanMessage(content=task_description)]}, tools
+        )
     except Exception as e:
         trace.fail(str(e))
         raise

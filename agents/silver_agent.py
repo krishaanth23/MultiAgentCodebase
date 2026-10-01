@@ -15,7 +15,7 @@ from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
 from core.config import SILVER_DIR, LLM_PROVIDER
-from core.llm import make_llm
+from core.llm import make_llm, invoke_agent_with_tool_recovery
 from core.audit import AuditLogger
 from core.observability import AgentTrace
 from agents.sttm_generator import SILVER_LOGIC_TAGS, parse_logic_tags
@@ -340,7 +340,9 @@ def execute_silver(
     agent = create_agent(llm, [inspect_tool, ingestion_tool], system_prompt=SILVER_AGENT_PROMPT)
 
     try:
-        result = agent.invoke({"messages": [HumanMessage(content=task_description)]})
+        result = invoke_agent_with_tool_recovery(
+            agent, {"messages": [HumanMessage(content=task_description)]}, [inspect_tool, ingestion_tool]
+        )
     except Exception as e:
         trace.fail(str(e))
         raise
