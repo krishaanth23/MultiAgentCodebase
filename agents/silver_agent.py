@@ -166,6 +166,11 @@ def _apply_silver_rules(input_files: list[str], sttm_path: str, run_id: str) -> 
             if source_col and target_col and source_col in df.columns and source_col != target_col:
                 df = df.rename(columns={source_col: target_col})
 
+            if not source_col:
+                # Rows with no source column are structural (the surrogate-key row --
+                # injected separately below), not something to tag-match or warn about.
+                continue
+
             working_col = target_col if target_col in df.columns else source_col
 
             tags = parse_logic_tags(logic)

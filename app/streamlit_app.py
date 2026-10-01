@@ -31,6 +31,7 @@ from core.config import LANDING_DIR, STTM_DIR
 from core.audit import AuditLogger
 from agents.orchestrator import (
     run_until_bronze_sttm,
+    run_bronze_sttm_regeneration,
     run_bronze_execution,
     run_silver_sttm_generation,
     run_silver_execution,
@@ -234,16 +235,17 @@ def _render_layer_output_review(
     button_label: str,
     back_phase: str,
     back_label: str,
-    feedback_key: str,
 ) -> None:
     """Preview the Parquet file(s) a layer just produced; gate the next step on approval.
 
     Shared by the Bronze/Silver/Gold output-review screens -- each one previews the
     materialised data itself (not just the STTM rules that produced it) before the
-    pipeline is allowed to move on. Offers two ways to act on what you see:
-    go back one step to redo the STTM that produced it (pure navigation -- nothing
-    here is re-run until you approve again from there), or approve forward with an
-    optional note about what to fix, which steers the next generation step.
+    pipeline is allowed to move on. Offers two ways to act on what you see: go back
+    one step to redo the STTM that produced it (pure navigation -- nothing here is
+    re-run until you approve again from there), or approve forward. The "what's
+    wrong?" feedback loop lives on the STTM review screens instead of here -- that's
+    where the actual AI-generated output (the STTM rules) is visible to react to;
+    this screen only shows deterministic execution output.
     """
     state = st.session_state.pipeline_state
     st.header(f"{icon} Review {layer_label} Output")
@@ -266,11 +268,6 @@ def _render_layer_output_review(
         with st.expander("Schema"):
             st.write({col: str(dtype) for col, dtype in df.dtypes.items()})
 
-    feedback = st.text_area(
-        "What's wrong? (optional -- tells the next agent what to fix)",
-        key=feedback_key,
-    )
-
     back_col, approve_col = st.columns([1, 2])
     with back_col:
         if st.button(back_label, use_container_width=True):
@@ -287,7 +284,7 @@ def _render_layer_output_review(
     with approve_col:
         if st.button(button_label, type="primary", use_container_width=True, disabled=not existing_paths):
             with st.spinner(spinner_text):
-                result = next_fn(state, user_feedback=feedback)
+                result = next_fn(state)
                 st.session_state.pipeline_state = result
                 st.session_state.current_run_id = result.get("run_id", st.session_state.current_run_id)
                 if result.get("error"):
@@ -583,21 +580,38 @@ with main_col:
             if selected_df.empty:
                 st.warning("Select at least one row to continue.")
 
-            if st.button("✅ Approve & Continue", type="primary", use_container_width=True, disabled=selected_df.empty):
-                # Save edited STTM
-                selected_df.to_csv(sttm_path, index=False)
+            bronze_feedback = st.text_area(
+                "What's wrong? (optional -- tells the AI what to fix, then regenerate)",
+                key="bronze_sttm_feedback",
+            )
 
-                with st.spinner("⚙️ Executing Bronze layer..."):
-                    # Transition: approved Bronze STTM triggers Bronze execution only.
-                    # Silver STTM isn't generated yet -- the user reviews Bronze output first.
-                    result = run_bronze_execution(state)
-                    st.session_state.pipeline_state = result
-                    st.session_state.current_run_id = result.get("run_id", st.session_state.current_run_id)
-                    if result.get("error"):
-                        st.error(f"❌ Error: {result['error']}")
-                    else:
-                        st.session_state.phase = "bronze_load"
-                        st.rerun()
+            regen_col, approve_col = st.columns([1, 2])
+            with regen_col:
+                if st.button("🔁 Regenerate Bronze STTM", use_container_width=True):
+                    with st.spinner("🔍 Regenerating Bronze STTM..."):
+                        result = run_bronze_sttm_regeneration(state, user_feedback=bronze_feedback)
+                        st.session_state.pipeline_state = result
+                        st.session_state.current_run_id = result.get("run_id", st.session_state.current_run_id)
+                        if result.get("error"):
+                            st.error(f"❌ Error: {result['error']}")
+                        else:
+                            st.rerun()
+            with approve_col:
+                if st.button("✅ Approve & Continue", type="primary", use_container_width=True, disabled=selected_df.empty):
+                    # Save edited STTM
+                    selected_df.to_csv(sttm_path, index=False)
+
+                    with st.spinner("⚙️ Executing Bronze layer..."):
+                        # Transition: approved Bronze STTM triggers Bronze execution only.
+                        # Silver STTM isn't generated yet -- the user reviews Bronze output first.
+                        result = run_bronze_execution(state)
+                        st.session_state.pipeline_state = result
+                        st.session_state.current_run_id = result.get("run_id", st.session_state.current_run_id)
+                        if result.get("error"):
+                            st.error(f"❌ Error: {result['error']}")
+                        else:
+                            st.session_state.phase = "bronze_load"
+                            st.rerun()
         else:
             st.error("Bronze STTM file not found.")
 
@@ -619,7 +633,6 @@ with main_col:
             button_label="✅ Approve & Generate Silver STTM",
             back_phase="bronze_sttm",
             back_label="⬅ Back to Bronze STTM",
-            feedback_key="bronze_load_feedback",
         )
 
 
@@ -655,20 +668,37 @@ with main_col:
             if selected_df.empty:
                 st.warning("Select at least one row to continue.")
 
-            if st.button("✅ Approve & Continue", type="primary", use_container_width=True, disabled=selected_df.empty):
-                selected_df.to_csv(sttm_path, index=False)
+            silver_feedback = st.text_area(
+                "What's wrong? (optional -- tells the AI what to fix, then regenerate)",
+                key="silver_sttm_feedback",
+            )
 
-                with st.spinner("⚙️ Executing Silver layer..."):
-                    # Transition: approved Silver STTM triggers Silver execution only.
-                    # Gold STTM isn't generated yet -- the user reviews Silver output first.
-                    result = run_silver_execution(state)
-                    st.session_state.pipeline_state = result
-                    st.session_state.current_run_id = result.get("run_id", st.session_state.current_run_id)
-                    if result.get("error"):
-                        st.error(f"❌ Error: {result['error']}")
-                    else:
-                        st.session_state.phase = "silver_load"
-                        st.rerun()
+            regen_col, approve_col = st.columns([1, 2])
+            with regen_col:
+                if st.button("🔁 Regenerate Silver STTM", use_container_width=True):
+                    with st.spinner("🔍 Regenerating Silver STTM..."):
+                        result = run_silver_sttm_generation(state, user_feedback=silver_feedback)
+                        st.session_state.pipeline_state = result
+                        st.session_state.current_run_id = result.get("run_id", st.session_state.current_run_id)
+                        if result.get("error"):
+                            st.error(f"❌ Error: {result['error']}")
+                        else:
+                            st.rerun()
+            with approve_col:
+                if st.button("✅ Approve & Continue", type="primary", use_container_width=True, disabled=selected_df.empty):
+                    selected_df.to_csv(sttm_path, index=False)
+
+                    with st.spinner("⚙️ Executing Silver layer..."):
+                        # Transition: approved Silver STTM triggers Silver execution only.
+                        # Gold STTM isn't generated yet -- the user reviews Silver output first.
+                        result = run_silver_execution(state)
+                        st.session_state.pipeline_state = result
+                        st.session_state.current_run_id = result.get("run_id", st.session_state.current_run_id)
+                        if result.get("error"):
+                            st.error(f"❌ Error: {result['error']}")
+                        else:
+                            st.session_state.phase = "silver_load"
+                            st.rerun()
         else:
             st.error("Silver STTM file not found.")
 
@@ -690,7 +720,6 @@ with main_col:
             button_label="✅ Approve & Generate Gold STTM",
             back_phase="silver_sttm",
             back_label="⬅ Back to Silver STTM",
-            feedback_key="silver_load_feedback",
         )
 
 
@@ -726,20 +755,37 @@ with main_col:
             if selected_df.empty:
                 st.warning("Select at least one row to continue.")
 
-            if st.button("✅ Approve & Execute", type="primary", use_container_width=True, disabled=selected_df.empty):
-                selected_df.to_csv(sttm_path, index=False)
+            gold_feedback = st.text_area(
+                "What's wrong? (optional -- tells the AI what to fix, then regenerate)",
+                key="gold_sttm_feedback",
+            )
 
-                with st.spinner("⚙️ Executing Gold layer..."):
-                    # Transition: approved Gold STTM triggers Gold execution only.
-                    # The report isn't generated yet -- the user reviews Gold output first.
-                    result = run_gold_execution(state)
-                    st.session_state.pipeline_state = result
-                    st.session_state.current_run_id = result.get("run_id", st.session_state.current_run_id)
-                    if result.get("error"):
-                        st.error(f"❌ Error: {result['error']}")
-                    else:
-                        st.session_state.phase = "gold_load"
-                        st.rerun()
+            regen_col, approve_col = st.columns([1, 2])
+            with regen_col:
+                if st.button("🔁 Regenerate Gold STTM", use_container_width=True):
+                    with st.spinner("🔍 Regenerating Gold STTM..."):
+                        result = run_gold_sttm_generation(state, user_feedback=gold_feedback)
+                        st.session_state.pipeline_state = result
+                        st.session_state.current_run_id = result.get("run_id", st.session_state.current_run_id)
+                        if result.get("error"):
+                            st.error(f"❌ Error: {result['error']}")
+                        else:
+                            st.rerun()
+            with approve_col:
+                if st.button("✅ Approve & Execute", type="primary", use_container_width=True, disabled=selected_df.empty):
+                    selected_df.to_csv(sttm_path, index=False)
+
+                    with st.spinner("⚙️ Executing Gold layer..."):
+                        # Transition: approved Gold STTM triggers Gold execution only.
+                        # The report isn't generated yet -- the user reviews Gold output first.
+                        result = run_gold_execution(state)
+                        st.session_state.pipeline_state = result
+                        st.session_state.current_run_id = result.get("run_id", st.session_state.current_run_id)
+                        if result.get("error"):
+                            st.error(f"❌ Error: {result['error']}")
+                        else:
+                            st.session_state.phase = "gold_load"
+                            st.rerun()
         else:
             st.error("Gold STTM file not found.")
 
@@ -761,7 +807,6 @@ with main_col:
             button_label="✅ Approve & Generate Report",
             back_phase="gold_sttm",
             back_label="⬅ Back to Gold STTM",
-            feedback_key="gold_load_feedback",
         )
 
 

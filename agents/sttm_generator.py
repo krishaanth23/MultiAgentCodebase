@@ -265,6 +265,36 @@ def _extract_sttm_rows(result: dict) -> list[dict]:
     return []
 
 
+def _generate_sttm_rows_via_llm(inner_prompt: str, max_attempts: int = 2) -> list[dict]:
+    """Call the LLM to produce a JSON array of STTM rows, retrying once if it comes
+    back empty or unparsed -- a non-deterministic LLM call often succeeds on a
+    second try. Returns [] only after exhausting attempts; callers MUST treat an
+    empty result as a failure, not silently write/report an empty STTM as success
+    (that's exactly what used to happen -- an unparsed response produced a
+    zero-row CSV that was reported back as a valid path).
+    """
+    for attempt in range(1, max_attempts + 1):
+        llm = make_llm()
+        response = llm.invoke(inner_prompt)
+        raw = response.content if hasattr(response, "content") else str(response)
+        if "```json" in raw:
+            raw = raw.split("```json")[1].split("```")[0]
+        elif "```" in raw:
+            raw = raw.split("```")[1].split("```")[0]
+        raw = raw.strip()
+        start, end = raw.find("["), raw.rfind("]")
+        if start != -1 and end != -1:
+            try:
+                rows = json.loads(raw[start: end + 1])
+                if isinstance(rows, list) and rows:
+                    return rows
+            except (json.JSONDecodeError, ValueError):
+                pass
+        suffix = " -- retrying" if attempt < max_attempts else " -- giving up"
+        print(f"[STTM] Attempt {attempt}/{max_attempts} produced no valid STTM rows{suffix}")
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Unified tool factory — all 4 tools built from the caller's context
 # ---------------------------------------------------------------------------
@@ -338,22 +368,9 @@ def _make_sttm_tools(
             "target_column, transformation_type, transformation_logic. "
             "No markdown fences, no prose."
         )
-        llm = make_llm()
-        response = llm.invoke(inner_prompt)
-        raw = response.content if hasattr(response, "content") else str(response)
-        # Strip fences if present
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0]
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0]
-        raw = raw.strip()
-        start, end = raw.find("["), raw.rfind("]")
-        rows = []
-        if start != -1 and end != -1:
-            try:
-                rows = json.loads(raw[start: end + 1])
-            except (json.JSONDecodeError, ValueError):
-                rows = []
+        rows = _generate_sttm_rows_via_llm(inner_prompt)
+        if not rows:
+            return json.dumps({"error": "LLM did not return any valid Bronze STTM rows after retrying."})
 
         sttm_path = str(STTM_DIR / f"sttm_bronze_{run_id[:8]}.csv")
         pd.DataFrame(rows).to_csv(sttm_path, index=False)
@@ -407,21 +424,9 @@ def _make_sttm_tools(
             "- Do NOT include markdown fences, prose, or any function/tool-call-like syntax.\n"
             "- Do NOT include run_id, file paths, or other metadata in the JSON rows.\n"
         )
-        llm = make_llm()
-        response = llm.invoke(inner_prompt)
-        raw = response.content if hasattr(response, "content") else str(response)
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0]
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0]
-        raw = raw.strip()
-        start, end = raw.find("["), raw.rfind("]")
-        rows = []
-        if start != -1 and end != -1:
-            try:
-                rows = json.loads(raw[start: end + 1])
-            except (json.JSONDecodeError, ValueError):
-                rows = []
+        rows = _generate_sttm_rows_via_llm(inner_prompt)
+        if not rows:
+            return json.dumps({"error": "LLM did not return any valid Silver STTM rows after retrying."})
 
         sttm_path = str(STTM_DIR / f"sttm_silver_{run_id[:8]}.csv")
         pd.DataFrame(rows).to_csv(sttm_path, index=False)
@@ -470,21 +475,9 @@ def _make_sttm_tools(
             "- If multiple Silver tables are relevant, include join rules (source_table, source_column -> target_table, target_column) as STTM rows so the Reporter can join tables.\n"
             "- Prefer completeness for intent-serving columns: include them even if you think they may be redundant.\n"
         )
-        llm = make_llm()
-        response = llm.invoke(inner_prompt)
-        raw = response.content if hasattr(response, "content") else str(response)
-        if "```json" in raw:
-            raw = raw.split("```json")[1].split("```")[0]
-        elif "```" in raw:
-            raw = raw.split("```")[1].split("```")[0]
-        raw = raw.strip()
-        start, end = raw.find("["), raw.rfind("]")
-        rows = []
-        if start != -1 and end != -1:
-            try:
-                rows = json.loads(raw[start: end + 1])
-            except (json.JSONDecodeError, ValueError):
-                rows = []
+        rows = _generate_sttm_rows_via_llm(inner_prompt)
+        if not rows:
+            return json.dumps({"error": "LLM did not return any valid Gold STTM rows after retrying."})
 
         sttm_path = str(STTM_DIR / f"sttm_gold_{run_id[:8]}.csv")
         pd.DataFrame(rows).to_csv(sttm_path, index=False)

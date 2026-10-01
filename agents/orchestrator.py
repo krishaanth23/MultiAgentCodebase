@@ -116,13 +116,16 @@ Then produces a business-intent-driven executive report.
 1. THINK: Read the phase goal carefully. What is the current state of the pipeline?
    What data is available? What needs to be produced by the end of this phase?
 
-2. PLAN: Write your explicit plan before calling any tool:
+2. PLAN: Before calling any tool, briefly note (1-2 sentences is enough):
    - Which agents will you call, and in what order?
    - What goal will you give each agent?
-   - What output do you expect from each agent, and how will you verify it?
-   - What could go wrong, and how will you handle it?
 
-3. ACT: Dispatch each specialist agent tool in your planned order.
+3. ACT: In THIS SAME RESPONSE, immediately make the actual tool call for the
+   first agent in your plan — do not end your turn after only describing the
+   plan in prose. Writing "I will call profiler_agent_tool" does not call it;
+   emitting a real tool call does. A response with reasoning text but zero
+   tool calls is an incomplete turn, not a completed phase, UNLESS every tool
+   in your plan has already been called in a previous turn.
    Give each agent a rich, specific goal description — not just "execute".
    Each tool you call launches a fully autonomous agent that will:
      * Inspect its own inputs
@@ -361,23 +364,73 @@ def run_until_bronze_sttm(uploaded_files: list[str], business_intent: str) -> Pi
                 "1. Profile the uploaded raw CSV files to understand their structure, "
                 "column semantics, data quality, and potential join keys across datasets.\n"
                 "2. Use that profile to generate a complete Bronze STTM CSV that covers "
-                "every column with ingestion rules (renaming, type casting, metadata injection).\n\n"
+                "every column with ingestion rules (renaming, metadata injection -- no type "
+                "casting, Bronze is a faithful raw copy).\n\n"
                 "Bronze is intent-agnostic — map every column mechanically. "
                 "Plan which tools to call and in what order. Verify each output before proceeding."
             ),
             phase_name="phase1",
             run_id=run_id,
         )
+
+        # Safety net: the Supervisor is an LLM and can end its turn after only
+        # describing a plan, without actually emitting the tool call(s) needed to
+        # execute it (observed with smaller models) -- or a tool call it did make
+        # could have hit an unrecoverable corruption (see core.llm's known
+        # limitation for multi-call agents). Either way, _run_supervisor can
+        # return without raising while the scratchpad stays incomplete. Detect
+        # that here and complete whichever step is missing directly, rather than
+        # silently handing the UI a Bronze STTM path that doesn't exist.
+        profile_path = scratchpad.get("profile_path", "")
+        if not profile_path:
+            print("[ORCHESTRATOR] Supervisor didn't complete profiling -- completing it directly.")
+            profile_path = profile_multiple_datasets(
+                file_paths=uploaded_files,
+                run_id=run_id,
+                task_description=(
+                    f"Profile the uploaded raw CSV files for run_id='{run_id}'.\n\n"
+                    f"Run ID: {run_id}\n"
+                    f"Files to profile: {uploaded_files}\n"
+                    "Inspect the files first, then compute full statistics, then return "
+                    "semantic analysis covering all columns, join keys, and quality notes."
+                ),
+            )
+        if not profile_path:
+            raise RuntimeError("Profiling produced no profile file.")
+
+        sttm_bronze_path = scratchpad.get("sttm_bronze_path", "")
+        if not sttm_bronze_path:
+            print("[ORCHESTRATOR] Supervisor didn't reach Bronze STTM generation -- completing it directly.")
+            sttm_bronze_path = generate_bronze_sttm(
+                profile_path=profile_path,
+                run_id=run_id,
+                task_description=(
+                    f"Generate the Bronze STTM from the profile for run_id='{run_id}'.\n\n"
+                    f"Run ID: {run_id}\n"
+                    f"Layer: Bronze\n"
+                    f"Profile path: {profile_path}\n"
+                    "Bronze is intent-agnostic. Inspect the profile context first, then "
+                    "generate a complete Bronze STTM covering every column. "
+                    "Add _load_timestamp and _source_file metadata rows. "
+                    "Do NOT add a surrogate key — that belongs in Silver."
+                ),
+            )
+        if not sttm_bronze_path:
+            raise RuntimeError(
+                "Bronze STTM generation produced no STTM file -- the LLM likely "
+                "failed to return valid rows even after retrying."
+            )
+
         state.update({
-            "profile_path": scratchpad.get("profile_path", ""),
-            "sttm_bronze_path": scratchpad.get("sttm_bronze_path", ""),
+            "profile_path": profile_path,
+            "sttm_bronze_path": sttm_bronze_path,
             "status": "awaiting_bronze_sttm_approval",
         })
         audit.log(
             "orchestrator", "phase1_supervisor_completed",
             status="success", phase="phase1",
-            profile_path=scratchpad.get("profile_path"),
-            sttm_bronze_path=scratchpad.get("sttm_bronze_path"),
+            profile_path=profile_path,
+            sttm_bronze_path=sttm_bronze_path,
         )
     except Exception as e:
         state.update({
@@ -387,6 +440,70 @@ def run_until_bronze_sttm(uploaded_files: list[str], business_intent: str) -> Pi
         audit.log(
             "orchestrator", "phase1_supervisor_failed",
             status="failed", phase="phase1", detail=str(e),
+        )
+
+    return state
+
+
+def run_bronze_sttm_regeneration(state: PipelineState, user_feedback: str = "") -> PipelineState:
+    """Regenerate the Bronze STTM directly from the already-produced profile.
+
+    UI contract: called by streamlit_app.py when the user wants the AI to redo
+    the Bronze STTM (optionally steered by feedback) without leaving the Bronze
+    STTM review screen. Status stays "awaiting_bronze_sttm_approval" -- this
+    doesn't advance the phase, just refreshes sttm_bronze_path.
+    """
+    audit = AuditLogger(state["run_id"])
+    state["error"] = ""
+
+    feedback_note = (
+        f"\nUser feedback on the previous Bronze STTM attempt to account for: {user_feedback.strip()}\n"
+        if user_feedback.strip() else ""
+    )
+
+    try:
+        audit.log(
+            "orchestrator", "bronze_sttm_regeneration_started",
+            status="in_progress", phase="bronze_sttm",
+            rationale="User requested the Bronze STTM be regenerated.",
+            user_feedback=user_feedback.strip(),
+        )
+        sttm_path = generate_bronze_sttm(
+            profile_path=state["profile_path"],
+            run_id=state["run_id"],
+            task_description=(
+                f"Regenerate the Bronze STTM from the profile for run_id='{state['run_id']}'.\n\n"
+                f"Run ID: {state['run_id']}\n"
+                f"Profile path: {state['profile_path']}\n"
+                "Bronze is intent-agnostic. Inspect the profile context first, then "
+                "generate a complete Bronze STTM covering every column. "
+                "Add _load_timestamp and _source_file metadata rows. "
+                "Do NOT add a surrogate key — that belongs in Silver."
+                f"{feedback_note}"
+            ),
+        )
+        if not sttm_path:
+            raise RuntimeError(
+                "Bronze STTM regeneration produced no STTM file -- the LLM likely "
+                "failed to return valid rows even after retrying."
+            )
+        state.update({
+            "sttm_bronze_path": sttm_path,
+            "status": "awaiting_bronze_sttm_approval",
+        })
+        audit.log(
+            "orchestrator", "bronze_sttm_regeneration_completed",
+            status="success", phase="bronze_sttm",
+            sttm_bronze_path=sttm_path,
+        )
+    except Exception as e:
+        state.update({
+            "error": f"Bronze STTM regeneration failed: {e}\n{traceback.format_exc()}",
+            "status": "failed",
+        })
+        audit.log(
+            "orchestrator", "bronze_sttm_regeneration_failed",
+            status="failed", phase="bronze_sttm", detail=str(e),
         )
 
     return state
@@ -420,6 +537,11 @@ def run_bronze_execution(state: PipelineState) -> PipelineState:
                 "apply to each file. Then execute ingestion across all input files."
             ),
         )
+        if not output_paths:
+            raise RuntimeError(
+                "Bronze execution produced no output files -- the agent may not have "
+                "actually run the ingestion tool. Try approving again."
+            )
         state.update({
             "bronze_output_paths": output_paths,
             "status": "awaiting_bronze_output_approval",
@@ -481,6 +603,11 @@ def run_silver_sttm_generation(state: PipelineState, user_feedback: str = "") ->
                 f"{feedback_note}"
             ),
         )
+        if not sttm_path:
+            raise RuntimeError(
+                "Silver STTM generation produced no STTM file -- the LLM likely "
+                "failed to return valid rows even after retrying."
+            )
         state.update({
             "sttm_silver_path": sttm_path,
             "status": "awaiting_silver_sttm_approval",
@@ -532,6 +659,11 @@ def run_silver_execution(state: PipelineState) -> PipelineState:
                 "across all Bronze inputs, producing Silver Parquet outputs."
             ),
         )
+        if not output_paths:
+            raise RuntimeError(
+                "Silver execution produced no output files -- the agent may not have "
+                "actually run the cleansing tool. Try approving again."
+            )
         state.update({
             "silver_output_paths": output_paths,
             "status": "awaiting_silver_output_approval",
@@ -595,6 +727,11 @@ def run_gold_sttm_generation(state: PipelineState, user_feedback: str = "") -> P
                 f"{feedback_note}"
             ),
         )
+        if not sttm_path:
+            raise RuntimeError(
+                "Gold STTM generation produced no STTM file -- the LLM likely "
+                "failed to return valid rows even after retrying."
+            )
         state.update({
             "sttm_gold_path": sttm_path,
             "status": "awaiting_gold_sttm_approval",
@@ -646,6 +783,11 @@ def run_gold_execution(state: PipelineState) -> PipelineState:
                 "Then materialise all Gold target tables from the Silver inputs."
             ),
         )
+        if not output_paths:
+            raise RuntimeError(
+                "Gold execution produced no output files -- the agent may not have "
+                "actually run the materialisation tool. Try approving again."
+            )
         state.update({
             "gold_output_paths": output_paths,
             "status": "awaiting_gold_output_approval",
@@ -706,6 +848,8 @@ def run_report_generation(state: PipelineState, user_feedback: str = "") -> Pipe
                 f"{feedback_note}"
             ),
         )
+        if not report_path:
+            raise RuntimeError("Report generation produced no report file.")
         state.update({
             "report_path": report_path,
             "status": "completed",
