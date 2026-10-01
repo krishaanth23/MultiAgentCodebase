@@ -11,11 +11,13 @@ I/O contract (UNCHANGED — UI and orchestrator safe):
 
 import json
 import os
+from types import SimpleNamespace
 import pandas as pd
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
-from core.config import PROFILES_DIR, LLM_PROVIDER, GROQ_API_KEY, GROQ_MODEL, GOOGLE_API_KEY, GEMINI_MODEL
+from core.config import PROFILES_DIR, LLM_PROVIDER
+from core.llm import make_llm
 from core.audit import AuditLogger
 from core.observability import AgentTrace
 
@@ -69,6 +71,11 @@ Return ONLY a valid JSON object — no markdown fences, no prose:
   ],
   "quality_notes": ["observation 1", "observation 2"]
 }"""
+
+""" IMPORTANT: This final answer must be plain assistant text content, NOT a tool call or
+function call. Do not invoke any tool (including one named "json") to produce it — after
+calling profiler_tool you are done with tools; just write the JSON directly as your
+message text. """
 
 
 # ---------------------------------------------------------------------------
@@ -165,20 +172,36 @@ def _make_profiler_tools(file_paths: list[str], run_id: str):
 
 
 # ---------------------------------------------------------------------------
-# LLM factory — single point for provider selection
-# ---------------------------------------------------------------------------
-
-def _make_llm():
-    if LLM_PROVIDER == "groq":
-        from langchain_groq import ChatGroq
-        return ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL)
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model=GEMINI_MODEL)
-
-
-# ---------------------------------------------------------------------------
 # Public entry points — I/O contract UNCHANGED
 # ---------------------------------------------------------------------------
+
+def _invoke_agent_with_json_tool_recovery(agent, messages_input: dict) -> dict:
+    """Invoke the agent, recovering from a Groq-specific phantom tool call.
+
+    Some Groq-hosted models (observed with openai/gpt-oss-*) occasionally emit a
+    tool call named "json"/"JSON" instead of writing their final JSON answer as
+    plain text, even when explicitly instructed not to. Groq rejects that call
+    with a 400 and echoes the intended payload back in `failed_generation` — the
+    content is correct, it's just mis-wrapped as a disallowed tool call. Recover
+    it rather than letting the whole phase fail.
+    """
+    try:
+        return agent.invoke(messages_input)
+    except Exception as e:
+        body = getattr(e, "body", None)
+        if not isinstance(body, dict):
+            raise
+        error = body.get("error", {})
+        if error.get("code") != "tool_use_failed":
+            raise
+        try:
+            recovered = json.loads(error.get("failed_generation", ""))
+            arguments = recovered["arguments"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            raise
+        print("[PROFILER] Recovered final answer from a rejected phantom tool call")
+        return {"messages": [SimpleNamespace(content=json.dumps(arguments))]}
+
 
 def profile_dataset(file_path: str, run_id: str, task_description: str) -> str:
     """Profile a single CSV file. Delegates to profile_multiple_datasets."""
@@ -200,17 +223,19 @@ def profile_multiple_datasets(file_paths: list[str], run_id: str, task_descripti
     trace.set_input(file_paths=file_paths)
 
     audit = AuditLogger(run_id)
-    print(f"[PROFILER] Started — files: {file_paths}")
+    print(f"[PROFILER] Started - files: {file_paths}")
     audit.log("profiler", "started_multi", input_files=file_paths)
 
     inspect_tool, stats_tool = _make_profiler_tools(file_paths, run_id)
-    llm = _make_llm()
+    llm = make_llm()
 
     print(f"[PROFILER] Running autonomous ReAct agent ({LLM_PROVIDER})")
     agent = create_agent(llm, [inspect_tool, stats_tool], system_prompt=PROFILER_AGENT_PROMPT)
 
     try:
-        result = agent.invoke({"messages": [HumanMessage(content=task_description)]})
+        result = _invoke_agent_with_json_tool_recovery(
+            agent, {"messages": [HumanMessage(content=task_description)]}
+        )
     except Exception as e:
         trace.fail(str(e))
         raise
@@ -251,11 +276,11 @@ def profile_multiple_datasets(file_paths: list[str], run_id: str, task_descripti
 
     profile_filename = f"profile_combined_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.json"
     profile_path = str(PROFILES_DIR / profile_filename)
-    print(f"[PROFILER] Saving profile → {profile_path}")
+    print(f"[PROFILER] Saving profile -> {profile_path}")
     with open(profile_path, "w", encoding="utf-8") as f:
         json.dump(combined_profile, f, indent=2)
 
     audit.log("profiler", "completed_multi", output_file=profile_path)
     trace.set_output(profile_path=profile_path).complete()
-    print(f"[PROFILER] Done — {profile_path}")
+    print(f"[PROFILER] Done - {profile_path}")
     return profile_path

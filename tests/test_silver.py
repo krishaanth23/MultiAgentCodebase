@@ -49,6 +49,19 @@ def _mock_agent_that_calls_tool(tool):
     return mock_agent
 
 
+def _mock_agent_that_calls_tools(tools):
+    """Return a mock agent whose .invoke() calls each tool in order (inspect, then
+    execute), like the real ReAct loop does, returning the LAST tool's result as
+    the final message -- execute_silver scans the final message for output paths,
+    so the mock must actually run the tool that produces them."""
+    mock_agent = MagicMock()
+    def fake_invoke(inputs):
+        messages = [MagicMock(content=tool.invoke({})) for tool in tools]
+        return {"messages": messages}
+    mock_agent.invoke.side_effect = fake_invoke
+    return mock_agent
+
+
 # ---------------------------------------------------------------------------
 # _apply_silver_rules — pure-Python core logic
 # ---------------------------------------------------------------------------
@@ -71,14 +84,14 @@ class TestApplySilverRules:
         assert df.shape[0] == 2
 
     def test_null_handling_fill_mean(self, tmp_path, monkeypatch):
-        """transformation_logic='fill null with mean' must replace NaN with the column mean."""
+        """transformation_logic='Fill nulls (mean)' must replace NaN with the column mean."""
         monkeypatch.setattr("agents.silver_agent.SILVER_DIR", tmp_path)
         bronze_path = tmp_path / "test_bronze.parquet"
         pd.DataFrame({"id": [1, 2, 3], "value": [10.0, None, 30.0]}).to_parquet(bronze_path, index=False)
 
         sttm_path = _make_silver_sttm(tmp_path, [
             {"source_table": "test_bronze.parquet", "source_column": "id",    "target_column": "id",    "transformation_type": "Direct", "transformation_logic": "Passthrough"},
-            {"source_table": "test_bronze.parquet", "source_column": "value", "target_column": "value", "transformation_type": "Direct", "transformation_logic": "fill null with mean"},
+            {"source_table": "test_bronze.parquet", "source_column": "value", "target_column": "value", "transformation_type": "Direct", "transformation_logic": "Fill nulls (mean)"},
         ])
 
         from agents.silver_agent import _apply_silver_rules
@@ -90,13 +103,13 @@ class TestApplySilverRules:
         assert df["value"].iloc[1] == pytest.approx(20.0)  # mean of 10 and 30
 
     def test_dedup_removes_duplicate_rows(self, tmp_path, monkeypatch):
-        """transformation_logic containing 'deduplic' must drop duplicate rows."""
+        """transformation_logic='Deduplicate' must drop duplicate rows."""
         monkeypatch.setattr("agents.silver_agent.SILVER_DIR", tmp_path)
         bronze_path = tmp_path / "test_bronze.parquet"
         pd.DataFrame({"id": [1, 1, 2], "value": [5.0, 5.0, 6.0]}).to_parquet(bronze_path, index=False)
 
         sttm_path = _make_silver_sttm(tmp_path, [
-            {"source_table": "test_bronze.parquet", "source_column": "id", "target_column": "id", "transformation_type": "Direct", "transformation_logic": "deduplicate rows"},
+            {"source_table": "test_bronze.parquet", "source_column": "id", "target_column": "id", "transformation_type": "Direct", "transformation_logic": "Deduplicate"},
         ])
 
         from agents.silver_agent import _apply_silver_rules
@@ -155,7 +168,7 @@ class TestExecuteSilver:
         from agents.silver_agent import execute_silver
 
         def fake_create_agent(llm, tools, system_prompt):
-            return _mock_agent_that_calls_tool(tools[0])  # tools[0] is a StructuredTool
+            return _mock_agent_that_calls_tools(tools)
 
         with patch("agents.silver_agent.create_agent", side_effect=fake_create_agent), \
              patch("agents.silver_agent.AuditLogger"):

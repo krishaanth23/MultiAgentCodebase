@@ -331,8 +331,7 @@ The LLM decides **when** to call tools and **what goal to pursue**. Python tools
 | Category | Library | Used for |
 |----------|---------|----------|
 | **Orchestration** | `langchain ≥0.2` | `create_agent`, `@tool`, ReAct loop, message types |
-| **LLM (Groq)** | `langchain-groq` | `ChatGroq` — llama3-8b-8192, mixtral-8x7b |
-| **LLM (Google)** | `langchain-google-genai` | `ChatGoogleGenerativeAI` — Gemini Pro |
+| **LLM (Groq)** | `langchain-groq` | `ChatGroq` — configurable via `GROQ_MODEL` (default `openai/gpt-oss-120b`) |
 | **UI** | `streamlit ≥1.32` | File upload, STTM approval, report rendering |
 | **Data** | `pandas` | CSV/Parquet read-write, all transformations |
 | **Storage** | `pyarrow` | Parquet file backend |
@@ -348,7 +347,7 @@ The LLM decides **when** to call tools and **what goal to pursue**. Python tools
 ### Prerequisites
 
 - Python 3.11+
-- A Groq API key **or** a Google AI (Gemini) API key
+- A Groq API key
 
 ### 1. Clone the repository
 
@@ -376,21 +375,11 @@ pip install -r requirements.txt
 Create a `.env` file in the project root:
 
 ```env
-# Choose one LLM provider
-LLM_PROVIDER=groq           # or: google
-
-# Groq API key (if using Groq)
 GROQ_API_KEY=your_groq_api_key_here
-GROQ_MODEL=llama3-8b-8192   # or: mixtral-8x7b-32768
-
-# Google API key (if using Gemini)
-GOOGLE_API_KEY=your_google_api_key_here
-GEMINI_MODEL=gemini-pro
+GROQ_MODEL=openai/gpt-oss-120b   # optional -- this is the default
 ```
 
 Get your Groq API key at [console.groq.com](https://console.groq.com)
-
-Get your Google API key at [aistudio.google.com](https://aistudio.google.com)
 
 ### 5. Create the data directories
 
@@ -439,23 +428,22 @@ sale_date,product_id,product_name,category,store_id,quantity,unit_price
 All configuration lives in `core/config.py`:
 
 ```python
-# LLM Provider — reads from .env
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")
+# LLM Provider -- Groq is the only supported provider
+LLM_PROVIDER = "groq"
 
-# API keys
-GROQ_API_KEY  = os.getenv("GROQ_API_KEY")
-GROQ_MODEL    = os.getenv("GROQ_MODEL", "llama3-8b-8192")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-GEMINI_MODEL  = os.getenv("GEMINI_MODEL", "gemini-pro")
+# API key + model (model is .env-configurable, with a working default)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL   = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # Data directories
-BASE_DIR      = Path(__file__).parent.parent / "data"
-BRONZE_DIR    = BASE_DIR / "bronze"
-SILVER_DIR    = BASE_DIR / "silver"
-GOLD_DIR      = BASE_DIR / "gold"
-STTM_DIR      = BASE_DIR / "sttm"
-PROFILES_DIR  = BASE_DIR / "profiles"
-REPORTS_DIR   = BASE_DIR / "reports"
+BASE_DIR     = Path(__file__).resolve().parent.parent
+DATA_DIR     = BASE_DIR / "data"
+BRONZE_DIR   = DATA_DIR / "bronze_layer"
+SILVER_DIR   = DATA_DIR / "silver_layer"
+GOLD_DIR     = DATA_DIR / "gold_layer"
+STTM_DIR     = DATA_DIR / "sttm"
+PROFILES_DIR = DATA_DIR / "profiles"
+REPORTS_DIR  = BASE_DIR / "reports"
 ```
 
 ---
@@ -542,9 +530,9 @@ No — it is a plain Python dictionary (`{}`). Both tools in a phase are created
 
 LLMs are unreliable at reproducing exact file system paths and UUIDs — they paraphrase and truncate. Closures capture the real values at tool creation time. The LLM just calls the tool; it never needs to know or reproduce the paths.
 
-**Q: Can I use a different LLM provider?**
+**Q: Can I use a different LLM model?**
 
-Yes. Set `LLM_PROVIDER=groq` or `LLM_PROVIDER=google` in your `.env` file. The `_make_llm()` factory in each agent reads this setting and returns the appropriate LangChain LLM object.
+Yes, within Groq's hosted models — set `GROQ_MODEL` in your `.env` file (default: `openai/gpt-oss-120b`). The `make_llm()` factory in `core/llm.py` is the single point where the model is constructed, used by every agent.
 
 **Q: What happens if a phase fails partway through?**
 

@@ -1,5 +1,5 @@
 import chromadb
-from core.config import GOOGLE_API_KEY, CHROMA_DIR, EMBEDDING_MODEL
+from core.config import CHROMA_DIR
 
 
 def get_chroma_client():
@@ -10,8 +10,8 @@ def get_chroma_client():
 def get_collection(name: str = "idamp_memory"):
     """Get or create the IDAMP memory collection (without embeddings to avoid version conflicts)."""
     client = get_chroma_client()
-    # Use ChromaDB without embeddings to avoid google-generativeai version conflicts
-    # This still provides semantic storage via metadata and document text
+    # Use ChromaDB without an embedding function -- avoids an extra embedding-API
+    # dependency entirely. This still provides storage via metadata and document text.
     return client.get_or_create_collection(name=name)
 
 

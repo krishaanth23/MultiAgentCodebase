@@ -50,6 +50,19 @@ def _mock_agent_that_calls_tool(tool):
     return mock_agent
 
 
+def _mock_agent_that_calls_tools(tools):
+    """Return a mock agent whose .invoke() calls each tool in order (inspect, then
+    execute), like the real ReAct loop does, returning the LAST tool's result as
+    the final message -- execute_gold scans the final message for output paths,
+    so the mock must actually run the tool that produces them."""
+    mock_agent = MagicMock()
+    def fake_invoke(inputs):
+        messages = [MagicMock(content=tool.invoke({})) for tool in tools]
+        return {"messages": messages}
+    mock_agent.invoke.side_effect = fake_invoke
+    return mock_agent
+
+
 # ---------------------------------------------------------------------------
 # _apply_gold_rules — pure-Python core logic
 # ---------------------------------------------------------------------------
@@ -65,7 +78,7 @@ class TestApplyGoldRules:
 
         from agents.gold_agent import _apply_gold_rules
         with patch("agents.gold_agent.AuditLogger"):
-            results = _apply_gold_rules([str(silver_path)], str(sttm_path), "analytics", "run-40")
+            results = _apply_gold_rules([str(silver_path)], str(sttm_path), "run-40")
 
         assert len(results) >= 1
         df = pd.read_parquet(results[0])
@@ -80,7 +93,7 @@ class TestApplyGoldRules:
 
         from agents.gold_agent import _apply_gold_rules
         with patch("agents.gold_agent.AuditLogger"):
-            results = _apply_gold_rules([str(silver_path)], str(sttm_path), "analytics", "run-41")
+            results = _apply_gold_rules([str(silver_path)], str(sttm_path), "run-41")
 
         assert pd.read_parquet(results[0]) is not None
 
@@ -99,7 +112,7 @@ class TestApplyGoldRules:
 
         from agents.gold_agent import _apply_gold_rules
         with patch("agents.gold_agent.AuditLogger"):
-            results = _apply_gold_rules([str(silver_path)], str(sttm_path), "analytics", "run-42")
+            results = _apply_gold_rules([str(silver_path)], str(sttm_path), "run-42")
 
         assert len(results) == 2
 
@@ -115,7 +128,7 @@ class TestApplyGoldRules:
 
         from agents.gold_agent import _apply_gold_rules
         with patch("agents.gold_agent.AuditLogger"):
-            results = _apply_gold_rules([str(silver_path)], str(sttm_path), "analytics", "run-43")
+            results = _apply_gold_rules([str(silver_path)], str(sttm_path), "run-43")
 
         df = pd.read_parquet(results[0])
         assert "keep" in df.columns
@@ -138,11 +151,11 @@ class TestExecuteGold:
         from agents.gold_agent import execute_gold
 
         def fake_create_agent(llm, tools, system_prompt):
-            return _mock_agent_that_calls_tool(tools[0])
+            return _mock_agent_that_calls_tools(tools)
 
         with patch("agents.gold_agent.create_agent", side_effect=fake_create_agent), \
              patch("agents.gold_agent.AuditLogger"):
-            results = execute_gold([str(silver_path)], str(sttm_path), "analytics", "run-50",
+            results = execute_gold([str(silver_path)], str(sttm_path), "run-50",
                                    task_description="Materialise test files for run-50.")
 
         assert isinstance(results, list)
@@ -171,7 +184,7 @@ class TestExecuteGold:
         from agents.gold_agent import execute_gold
         with patch("agents.gold_agent.create_agent", side_effect=fake_create_agent), \
              patch("agents.gold_agent.AuditLogger"):
-            execute_gold([str(silver_path)], str(sttm_path), "analytics", "run-51", task_description="custom gold task")
+            execute_gold([str(silver_path)], str(sttm_path), "run-51", task_description="custom gold task")
 
         assert any("custom gold task" in str(getattr(m, "content", "")) for m in captured)
 

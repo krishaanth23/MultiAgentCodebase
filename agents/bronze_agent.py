@@ -15,8 +15,10 @@ from datetime import datetime, timezone
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
-from core.config import BRONZE_DIR, LLM_PROVIDER, GROQ_API_KEY, GROQ_MODEL, GOOGLE_API_KEY, GEMINI_MODEL
+from core.config import BRONZE_DIR, LLM_PROVIDER
+from core.llm import make_llm
 from core.audit import AuditLogger
+from agents.sttm_generator import BRONZE_LOGIC_TAGS, parse_logic_tags
 from core.observability import AgentTrace
 
 
@@ -137,14 +139,19 @@ def _apply_bronze_rules(input_files: list[str], sttm_path: str, run_id: str) -> 
             if not working_col or working_col not in df.columns:
                 continue
 
+            tags = parse_logic_tags(logic)
+            if tags and not (tags & BRONZE_LOGIC_TAGS):
+                print(f"[BRONZE] Unrecognised transformation_logic {logic!r} for column "
+                      f"'{working_col}' -- treating as passthrough.")
+
             try:
-                if "text format" in logic or ("convert" in logic and "text" in logic):
+                if "cast to text" in tags:
                     df[working_col] = df[working_col].astype(str)
-                elif "integer" in logic or "whole number" in logic:
+                elif "cast to integer" in tags:
                     df[working_col] = pd.to_numeric(df[working_col], errors="coerce").astype("Int64")
-                elif "float" in logic or "decimal" in logic or "numeric" in logic:
+                elif "cast to float" in tags:
                     df[working_col] = pd.to_numeric(df[working_col], errors="coerce")
-                elif "date" in logic or "datetime" in logic:
+                elif "cast to date" in tags:
                     df[working_col] = pd.to_datetime(df[working_col], errors="coerce")
             except (ValueError, TypeError):
                 pass
@@ -204,18 +211,6 @@ def _make_bronze_tools(input_files: list[str], sttm_path: str, run_id: str):
 
 
 # ---------------------------------------------------------------------------
-# LLM factory
-# ---------------------------------------------------------------------------
-
-def _make_llm():
-    if LLM_PROVIDER == "groq":
-        from langchain_groq import ChatGroq
-        return ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL)
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model=GEMINI_MODEL)
-
-
-# ---------------------------------------------------------------------------
 # Public entry point — I/O contract UNCHANGED
 # ---------------------------------------------------------------------------
 
@@ -243,7 +238,7 @@ def execute_bronze(
     trace.set_input(input_files=input_files, sttm_path=sttm_path)
 
     inspect_tool, ingestion_tool = _make_bronze_tools(input_files, sttm_path, run_id)
-    llm = _make_llm()
+    llm = make_llm()
 
     print(f"[BRONZE] Running autonomous ReAct agent ({LLM_PROVIDER})")
     agent = create_agent(llm, [inspect_tool, ingestion_tool], system_prompt=BRONZE_AGENT_PROMPT)

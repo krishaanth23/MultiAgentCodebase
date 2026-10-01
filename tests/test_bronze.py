@@ -47,6 +47,21 @@ def _mock_agent_that_calls_tool(tool):
     return mock_agent
 
 
+def _mock_agent_that_calls_tools(tools):
+    """Return a mock agent whose .invoke() calls each tool in order (inspect, then
+    execute), like the real ReAct loop does, returning the LAST tool's result as
+    the final message -- execute_bronze scans the final message for output paths,
+    so the mock must actually run the tool that produces them."""
+    mock_agent = MagicMock()
+    def fake_invoke(inputs):
+        messages = []
+        for tool in tools:
+            messages.append(MagicMock(content=tool.invoke({})))
+        return {"messages": messages}
+    mock_agent.invoke.side_effect = fake_invoke
+    return mock_agent
+
+
 # ---------------------------------------------------------------------------
 # _apply_bronze_rules - pure-Python core logic
 # ---------------------------------------------------------------------------
@@ -150,7 +165,7 @@ class TestExecuteBronze:
         from agents.bronze_agent import execute_bronze
 
         def fake_create_agent(llm, tools, system_prompt):
-            return _mock_agent_that_calls_tool(tools[0])
+            return _mock_agent_that_calls_tools(tools)
 
         with patch("agents.bronze_agent.create_agent", side_effect=fake_create_agent), \
              patch("agents.bronze_agent.AuditLogger"):

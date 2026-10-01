@@ -11,34 +11,45 @@ to the per-agent traces written by each specialist agent.
 
 ## Architecture
 
-Four HITL-gated phases. Each phase runs a fresh Supervisor agent with the tools
-relevant to that phase. The Supervisor is NOT given a rigid script — it reasons
-about the pipeline state and decides how to proceed.
+Six HITL gates: one STTM-approval gate and one output-approval gate per layer
+(Bronze/Silver/Gold), so the user can inspect the materialised data itself —
+not just the rules that will produce it — before the pipeline moves on.
 
-Phase 1 — Profile & Bronze STTM 
-    Tools available: profiler_agent_tool, sttm_agent_tool
-    Goal: understand raw data structure and produce Bronze ingestion rules for review.
+Only Phase 1 (profiling + Bronze STTM generation) still runs as a Supervisor
+ReAct loop choosing between two tools — there's a real sequencing decision
+there. Every other step below is a single specialist agent invoked directly:
+once the UI has already gated the step to exactly one action, routing it
+through an extra Supervisor "decide what to call" LLM turn adds nothing but
+another API call, so those steps call the specialist agent's entry point
+directly instead.
 
-Phase 2 — Bronze Execution & Silver STTM 
-    Tools available: bronze_agent_tool, sttm_agent_tool
-    Goal: ingest approved Bronze rules, then produce Silver cleansing rules for review.
+Phase 1 — Profile & Bronze STTM (Supervisor: profiler_agent_tool, sttm_agent_tool)
+    -> HITL: approve Bronze STTM
+Bronze execution (direct: execute_bronze)
+    -> HITL: approve Bronze output
+Silver STTM generation (direct: generate_silver_sttm)
+    -> HITL: approve Silver STTM
+Silver execution (direct: execute_silver)
+    -> HITL: approve Silver output
+Gold STTM generation (direct: generate_gold_sttm)
+    -> HITL: approve Gold STTM
+Gold execution (direct: execute_gold)
+    -> HITL: approve Gold output
+Report generation (direct: generate_report)
+    -> done
 
-Phase 3 — Silver Execution & Gold STTM (intent-driven Gold STTM)
-    Tools available: silver_agent_tool, sttm_agent_tool
-    Goal: cleanse Bronze outputs, then produce Gold materialisation rules for review.
-
-Phase 4 — Gold Execution & Report (intent-driven Report)
-    Tools available: gold_agent_tool, reporter_agent_tool
-    Goal: materialise Gold tables, then produce the executive report.
-
-UI contract (UNCHANGED — streamlit_app.py reads these):
+UI contract (streamlit_app.py calls these directly):
     run_until_bronze_sttm(uploaded_files, business_intent) -> PipelineState
-    run_bronze_to_silver_sttm(state) -> PipelineState
-    run_silver_to_gold_sttm(state) -> PipelineState
-    run_gold_and_report(state) -> PipelineState
+    run_bronze_execution(state) -> PipelineState
+    run_silver_sttm_generation(state) -> PipelineState
+    run_silver_execution(state) -> PipelineState
+    run_gold_sttm_generation(state) -> PipelineState
+    run_gold_execution(state) -> PipelineState
+    run_report_generation(state) -> PipelineState
 
-PipelineState keys read by UI (UNCHANGED):
-    run_id, status, error, sttm_bronze_path, sttm_silver_path, sttm_gold_path, report_path
+PipelineState keys read by UI:
+    run_id, status, error, sttm_bronze_path, sttm_silver_path, sttm_gold_path,
+    bronze_output_paths, silver_output_paths, gold_output_paths, report_path
 """
 
 import json
@@ -49,7 +60,7 @@ from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
 from core.audit import AuditLogger
-from core.config import LLM_PROVIDER, GROQ_API_KEY, GROQ_MODEL, GOOGLE_API_KEY, GEMINI_MODEL
+from core.llm import make_llm
 from core.memory import store_document
 from core.observability import AgentTrace
 from agents.profiler import profile_multiple_datasets
@@ -146,18 +157,6 @@ and understanding the pipeline state."""
 
 
 # ---------------------------------------------------------------------------
-# LLM factory — single point for provider selection
-# ---------------------------------------------------------------------------
-
-def _make_llm():
-    if LLM_PROVIDER == "groq":
-        from langchain_groq import ChatGroq
-        return ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL)
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model=GEMINI_MODEL)
-
-
-# ---------------------------------------------------------------------------
 # Phase 1 tool factory: profiler_agent_tool + sttm_agent_tool (Bronze)
 # ---------------------------------------------------------------------------
 
@@ -234,254 +233,6 @@ def _make_phase1_tools(uploaded_files: list[str], run_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Phase 2 tool factory: bronze_agent_tool + sttm_agent_tool (Silver)
-# ---------------------------------------------------------------------------
-
-def _make_phase2_tools(
-    uploaded_files: list[str],
-    sttm_bronze_path: str,
-    run_id: str,
-):
-    """Build Phase 2 tools: Bronze execution and Silver STTM generator (intent-agnostic)."""
-    scratchpad: dict = {}
-
-    @tool
-    def bronze_agent_tool(goal: str) -> str:
-        """Dispatch the autonomous Bronze layer ingestion agent.
-
-        The Bronze agent will inspect the raw CSV input files and the approved STTM
-        rules, form an explicit ingestion plan, apply column renaming, type casting,
-        and metadata injection (_load_timestamp, _source_file), and write Bronze
-        Parquet artifacts. It operates on the approved Bronze STTM rules exactly.
-
-        Pass a goal describing what ingestion is needed — the agent handles the
-        execution details autonomously.
-        Returns JSON: {"bronze_output_paths": ["path1.parquet", ...]}.
-        Must be called before sttm_agent_tool in Phase 2.
-        """
-        print(f"[ORCHESTRATOR] Dispatching Bronze agent | goal: {goal[:120]}")
-        output_paths = execute_bronze(
-            input_files=uploaded_files,
-            sttm_path=sttm_bronze_path,
-            run_id=run_id,
-            task_description=(
-                f"{goal}\n\n"
-                f"Run ID: {run_id}\n"
-                f"Input CSV files: {uploaded_files}\n"
-                f"Approved Bronze STTM: {sttm_bronze_path}\n"
-                "Inspect the files and STTM rules first. Plan which transformations "
-                "apply to each file. Then execute ingestion across all input files."
-            ),
-        )
-        scratchpad["bronze_output_paths"] = output_paths
-        return json.dumps({"bronze_output_paths": output_paths})
-
-    @tool
-    def sttm_agent_tool(goal: str) -> str:
-        """Dispatch the autonomous STTM generation agent.
-
-        In Phase 2: generates Silver cleansing rules (null handling, deduplication,
-        type casting, date standardisation, surrogate key injection) from the Bronze
-        Parquet outputs. Silver is intent-agnostic — standard cleansing is applied
-        to every Bronze column. Requires bronze_agent_tool to have run first.
-
-        Pass a goal that clearly states: which layer's STTM to generate (Silver)
-        and what cleansing is expected.
-        Returns JSON: {"sttm_path": "path/to/sttm.csv", "row_count": N}.
-        """
-        if "bronze_output_paths" not in scratchpad:
-            return json.dumps({"error": "bronze_agent_tool must be called before sttm_agent_tool"})
-        print(f"[ORCHESTRATOR] Dispatching STTM agent (Silver) | goal: {goal[:120]}")
-        sttm_path = generate_silver_sttm(
-            bronze_output_paths=scratchpad["bronze_output_paths"],
-            bronze_sttm_path=sttm_bronze_path,
-            run_id=run_id,
-            task_description=(
-                f"{goal}\n\n"
-                f"Run ID: {run_id}\n"
-                f"Layer: Silver\n"
-                f"Bronze output files: {scratchpad['bronze_output_paths']}\n"
-                f"Approved Bronze STTM: {sttm_bronze_path}\n"
-                "Silver is intent-agnostic. Inspect the Bronze Parquet metadata first. "
-                "Plan null handling, type casting, deduplication, and date standardisation "
-                "for every column. Add surrogate key as the first row. Then generate the "
-                "complete Silver STTM."
-            ),
-        )
-        scratchpad["sttm_silver_path"] = sttm_path
-        return json.dumps({"sttm_path": sttm_path})
-
-    return bronze_agent_tool, sttm_agent_tool, scratchpad
-
-
-# ---------------------------------------------------------------------------
-# Phase 3 tool factory: silver_agent_tool + sttm_agent_tool (Gold)
-# ---------------------------------------------------------------------------
-
-def _make_phase3_tools(
-    bronze_output_paths: list[str],
-    sttm_silver_path: str,
-    business_intent: str,
-    run_id: str,
-):
-    """Build Phase 3 tools: Silver execution and Gold STTM generator."""
-    scratchpad: dict = {}
-
-    @tool
-    def silver_agent_tool(goal: str) -> str:
-        """Dispatch the autonomous Silver layer cleansing agent.
-
-        The Silver agent will inspect the Bronze Parquet inputs and approved STTM
-        cleansing rules, form an explicit cleansing plan covering null handling,
-        deduplication, type casting, date standardisation, and surrogate key injection,
-        then execute cleansing across all Bronze inputs.
-
-        Pass a goal describing what cleansing quality is expected — the agent handles
-        execution details autonomously.
-        Returns JSON: {"silver_output_paths": ["path1.parquet", ...]}.
-        Must be called before sttm_agent_tool in Phase 3.
-        """
-        print(f"[ORCHESTRATOR] Dispatching Silver agent | goal: {goal[:120]}")
-        output_paths = execute_silver(
-            input_files=bronze_output_paths,
-            sttm_path=sttm_silver_path,
-            run_id=run_id,
-            task_description=(
-                f"{goal}\n\n"
-                f"Run ID: {run_id}\n"
-                f"Input Bronze files: {bronze_output_paths}\n"
-                f"Approved Silver STTM: {sttm_silver_path}\n"
-                "Inspect the Bronze Parquet schemas and STTM rules first. Plan the "
-                "cleansing approach for each column and file. Then execute cleansing "
-                "across all Bronze inputs, producing Silver Parquet outputs."
-            ),
-        )
-        scratchpad["silver_output_paths"] = output_paths
-        return json.dumps({"silver_output_paths": output_paths})
-
-    @tool
-    def sttm_agent_tool(goal: str) -> str:
-        """Dispatch the autonomous STTM generation agent.
-
-        In Phase 3: generates Gold materialisation rules (joins across Silver tables,
-        renames, aggregations, surrogate key) from the Silver Parquet outputs.
-        Requires silver_agent_tool to have run first.
-
-        Pass a goal that clearly states: which layer's STTM to generate (Gold),
-        what analytics-ready tables are needed, and what the business intent is.
-        Returns JSON: {"sttm_path": "path/to/sttm.csv", "row_count": N}.
-        """
-        if "silver_output_paths" not in scratchpad:
-            return json.dumps({"error": "silver_agent_tool must be called before sttm_agent_tool"})
-        print(f"[ORCHESTRATOR] Dispatching STTM agent (Gold) | goal: {goal[:120]}")
-        sttm_path = generate_gold_sttm(
-            silver_output_paths=scratchpad["silver_output_paths"],
-            silver_sttm_path=sttm_silver_path,
-            business_intent=business_intent,
-            run_id=run_id,
-            task_description=(
-                f"{goal}\n\n"
-                f"Run ID: {run_id}\n"
-                f"Layer: Gold\n"
-                f"Business intent: {business_intent}\n"
-                f"Silver output files: {scratchpad['silver_output_paths']}\n"
-                f"Approved Silver STTM: {sttm_silver_path}\n"
-                "Inspect the Silver Parquet metadata first. Plan join keys, column "
-                "renames, and aggregation rules. Build queryable analytics-ready tables "
-                "— do NOT pre-aggregate for the business question. Add surrogate key "
-                "as the first row. Then generate the complete Gold STTM."
-            ),
-        )
-        scratchpad["sttm_gold_path"] = sttm_path
-        return json.dumps({"sttm_path": sttm_path})
-
-    return silver_agent_tool, sttm_agent_tool, scratchpad
-
-
-# ---------------------------------------------------------------------------
-# Phase 4 tool factory: gold_agent_tool + reporter_agent_tool
-# ---------------------------------------------------------------------------
-
-def _make_phase4_tools(
-    silver_output_paths: list[str],
-    sttm_gold_path: str,
-    business_intent: str,
-    run_id: str,
-):
-    """Build Phase 4 tools: Gold execution and report generation."""
-    scratchpad: dict = {}
-
-    @tool
-    def gold_agent_tool(goal: str) -> str:
-        """Dispatch the autonomous Gold layer materialisation agent.
-
-        The Gold agent will inspect the Silver Parquet inputs and approved STTM
-        materialisation rules, form an explicit plan covering joins across source
-        tables, column renames, aggregations, and surrogate key injection, then
-        materialise all Gold target tables.
-
-        Pass a goal describing what analytics-ready tables are needed — the agent
-        handles execution autonomously. Business intent is already baked into the
-        approved Gold STTM, so this dispatch is intent-agnostic.
-        Returns JSON: {"gold_output_paths": ["path1.parquet", ...]}.
-        Must be called before reporter_agent_tool in Phase 4.
-        """
-        print(f"[ORCHESTRATOR] Dispatching Gold agent | goal: {goal[:120]}")
-        output_paths = execute_gold(
-            input_files=silver_output_paths,
-            sttm_path=sttm_gold_path,
-            run_id=run_id,
-            task_description=(
-                f"{goal}\n\n"
-                f"Run ID: {run_id}\n"
-                f"Input Silver files: {silver_output_paths}\n"
-                f"Approved Gold STTM: {sttm_gold_path}\n"
-                "Inspect the Silver Parquet schemas and Gold STTM rules first, grouped "
-                "by target table. Plan joins, renames, and aggregations per Gold table. "
-                "Then materialise all Gold target tables from the Silver inputs."
-            ),
-        )
-        scratchpad["gold_output_paths"] = output_paths
-        return json.dumps({"gold_output_paths": output_paths})
-
-    @tool
-    def reporter_agent_tool(goal: str) -> str:
-        """Dispatch the autonomous Reporter agent.
-
-        The Reporter agent will inspect the available Gold tables, form an analytical
-        plan to answer the business question, load the tables into DuckDB, write and
-        execute SQL, then render a self-contained HTML executive report with charts.
-
-        Pass a goal that clearly states the business question and what kind of analysis
-        and visualisation is expected — the agent handles execution autonomously.
-        Requires gold_agent_tool to have run first.
-        Returns JSON: {"report_path": "path/to/report.html"}.
-        """
-        if "gold_output_paths" not in scratchpad:
-            return json.dumps({"error": "gold_agent_tool must be called before reporter_agent_tool"})
-        print(f"[ORCHESTRATOR] Dispatching Reporter agent | goal: {goal[:120]}")
-        report_path = generate_report(
-            gold_files=scratchpad["gold_output_paths"],
-            business_intent=business_intent,
-            run_id=run_id,
-            task_description=(
-                f"{goal}\n\n"
-                f"Run ID: {run_id}\n"
-                f"Business question: {business_intent}\n"
-                f"Gold files: {scratchpad['gold_output_paths']}\n"
-                "Inspect the Gold tables first to understand their structure. Plan your "
-                "SQL approach to directly answer the business question. Load the tables, "
-                "execute your query, analyse results, and produce a structured HTML report "
-                "with charts that provide visual evidence for your answer."
-            ),
-        )
-        scratchpad["report_path"] = report_path
-        return json.dumps({"report_path": report_path})
-
-    return gold_agent_tool, reporter_agent_tool, scratchpad
-
-
-# ---------------------------------------------------------------------------
 # Autonomous Supervisor runner — the orchestrator's own ReAct loop
 # ---------------------------------------------------------------------------
 
@@ -513,7 +264,7 @@ def _run_supervisor(
         tools_available=[t.name for t in tools],
     )
 
-    llm = _make_llm()
+    llm = make_llm()
     agent = create_agent(llm, tools, system_prompt=SUPERVISOR_PROMPT)
 
     print(f"[ORCHESTRATOR] Supervisor starting {phase_name} autonomously")
@@ -639,210 +390,337 @@ def run_until_bronze_sttm(uploaded_files: list[str], business_intent: str) -> Pi
     return state
 
 
-def run_bronze_to_silver_sttm(state: PipelineState) -> PipelineState:
-    """Phase 2: Supervisor executes Bronze layer and generates Silver STTM, then pauses for HITL.
+def run_bronze_execution(state: PipelineState) -> PipelineState:
+    """Execute the approved Bronze STTM directly (single action -- no Supervisor step).
 
     UI contract: called by streamlit_app.py after Bronze STTM approval.
-    Returns PipelineState with bronze_output_paths and sttm_silver_path populated.
+    Returns PipelineState with bronze_output_paths populated, awaiting output approval.
     """
     audit = AuditLogger(state["run_id"])
     state["bronze_sttm_approved"] = True
     state["error"] = ""
 
-    bronze_t, sttm_t, scratchpad = _make_phase2_tools(
-        uploaded_files=state["uploaded_files"],
-        sttm_bronze_path=state["sttm_bronze_path"],
-        run_id=state["run_id"],
-    )
-
     try:
         audit.log(
-            "orchestrator", "phase2_supervisor_started",
-            status="in_progress", phase="phase2",
-            rationale=(
-                "User approved Bronze STTM. Supervisor will autonomously execute Bronze "
-                "ingestion and generate Silver cleansing rules."
-            ),
+            "orchestrator", "bronze_execution_started",
+            status="in_progress", phase="bronze_execution",
+            rationale="User approved Bronze STTM. Executing Bronze ingestion directly.",
         )
-        _run_supervisor(
-            tools=[bronze_t, sttm_t],
-            phase_goal=(
-                f"Phase 2 goal for run_id='{state['run_id']}'.\n\n"
-                f"Uploaded raw files: {state['uploaded_files']}\n"
-                f"Approved Bronze STTM: {state['sttm_bronze_path']}\n\n"
-                "You need to accomplish two things in this phase:\n"
-                "1. Execute the approved Bronze ingestion rules to transform raw CSV files "
-                "into Bronze Parquet artifacts with lineage metadata.\n"
-                "2. Inspect the Bronze outputs and generate a Silver STTM that cleanses every "
-                "column — handle nulls, deduplicate, cast types, standardise dates, and inject "
-                "a surrogate key as the first row.\n\n"
-                "Silver is intent-agnostic — standard cleansing applies to every column. "
-                "Plan which tools to call and in what order. Verify each output before proceeding."
-            ),
-            phase_name="phase2",
+        output_paths = execute_bronze(
+            input_files=state["uploaded_files"],
+            sttm_path=state["sttm_bronze_path"],
             run_id=state["run_id"],
+            task_description=(
+                f"Run ID: {state['run_id']}\n"
+                f"Input CSV files: {state['uploaded_files']}\n"
+                f"Approved Bronze STTM: {state['sttm_bronze_path']}\n"
+                "Inspect the files and STTM rules first. Plan which transformations "
+                "apply to each file. Then execute ingestion across all input files."
+            ),
         )
         state.update({
-            "bronze_output_paths": scratchpad.get("bronze_output_paths", []),
-            "sttm_silver_path": scratchpad.get("sttm_silver_path", ""),
-            "status": "awaiting_silver_sttm_approval",
+            "bronze_output_paths": output_paths,
+            "status": "awaiting_bronze_output_approval",
         })
         audit.log(
-            "orchestrator", "phase2_supervisor_completed",
-            status="success", phase="phase2",
-            bronze_output_paths=scratchpad.get("bronze_output_paths"),
-            sttm_silver_path=scratchpad.get("sttm_silver_path"),
+            "orchestrator", "bronze_execution_completed",
+            status="success", phase="bronze_execution",
+            bronze_output_paths=output_paths,
         )
     except Exception as e:
         state.update({
-            "error": f"Phase 2 supervisor failed: {e}\n{traceback.format_exc()}",
+            "error": f"Bronze execution failed: {e}\n{traceback.format_exc()}",
             "status": "failed",
         })
         audit.log(
-            "orchestrator", "phase2_supervisor_failed",
-            status="failed", phase="phase2", detail=str(e),
+            "orchestrator", "bronze_execution_failed",
+            status="failed", phase="bronze_execution", detail=str(e),
         )
 
     return state
 
 
-def run_silver_to_gold_sttm(state: PipelineState) -> PipelineState:
-    """Phase 3: Supervisor executes Silver layer and generates Gold STTM, then pauses for HITL.
+def run_silver_sttm_generation(state: PipelineState, user_feedback: str = "") -> PipelineState:
+    """Generate the Silver STTM directly from the approved Bronze output.
 
-    UI contract: called by streamlit_app.py after Silver STTM approval.
-    Returns PipelineState with silver_output_paths and sttm_gold_path populated.
+    UI contract: called by streamlit_app.py after Bronze output approval.
+    user_feedback: optional note from the user about what the Bronze output got
+    wrong, folded into the generation goal so the Silver STTM can account for it.
+    Returns PipelineState with sttm_silver_path populated, awaiting STTM approval.
+    """
+    audit = AuditLogger(state["run_id"])
+    state["error"] = ""
+
+    feedback_note = (
+        f"\nUser feedback on the Bronze output to account for: {user_feedback.strip()}\n"
+        if user_feedback.strip() else ""
+    )
+
+    try:
+        audit.log(
+            "orchestrator", "silver_sttm_started",
+            status="in_progress", phase="silver_sttm",
+            rationale="User approved Bronze output. Generating Silver STTM directly.",
+            user_feedback=user_feedback.strip(),
+        )
+        sttm_path = generate_silver_sttm(
+            bronze_output_paths=state["bronze_output_paths"],
+            bronze_sttm_path=state["sttm_bronze_path"],
+            run_id=state["run_id"],
+            task_description=(
+                f"Run ID: {state['run_id']}\n"
+                f"Layer: Silver\n"
+                f"Bronze output files: {state['bronze_output_paths']}\n"
+                f"Approved Bronze STTM: {state['sttm_bronze_path']}\n"
+                "Silver is intent-agnostic. Inspect the Bronze Parquet metadata first. "
+                "Plan null handling, type casting, deduplication, and date standardisation "
+                "for every column. Add surrogate key as the first row. Then generate the "
+                "complete Silver STTM."
+                f"{feedback_note}"
+            ),
+        )
+        state.update({
+            "sttm_silver_path": sttm_path,
+            "status": "awaiting_silver_sttm_approval",
+        })
+        audit.log(
+            "orchestrator", "silver_sttm_completed",
+            status="success", phase="silver_sttm",
+            sttm_silver_path=sttm_path,
+        )
+    except Exception as e:
+        state.update({
+            "error": f"Silver STTM generation failed: {e}\n{traceback.format_exc()}",
+            "status": "failed",
+        })
+        audit.log(
+            "orchestrator", "silver_sttm_failed",
+            status="failed", phase="silver_sttm", detail=str(e),
+        )
+
+    return state
+
+
+def run_silver_execution(state: PipelineState) -> PipelineState:
+    """Execute the approved Silver STTM directly.
+
+    UI contract: called by streamlit_app.py after Silver output approval.
+    Returns PipelineState with silver_output_paths populated, awaiting output approval.
     """
     audit = AuditLogger(state["run_id"])
     state["silver_sttm_approved"] = True
     state["error"] = ""
 
-    silver_t, sttm_t, scratchpad = _make_phase3_tools(
-        bronze_output_paths=state["bronze_output_paths"],
-        sttm_silver_path=state["sttm_silver_path"],
-        business_intent=state["business_intent"],
-        run_id=state["run_id"],
-    )
-
     try:
         audit.log(
-            "orchestrator", "phase3_supervisor_started",
-            status="in_progress", phase="phase3",
-            rationale=(
-                "User approved Silver STTM. Supervisor will autonomously execute Silver "
-                "cleansing and generate Gold materialisation rules."
-            ),
+            "orchestrator", "silver_execution_started",
+            status="in_progress", phase="silver_execution",
+            rationale="User approved Silver STTM. Executing Silver cleansing directly.",
         )
-        _run_supervisor(
-            tools=[silver_t, sttm_t],
-            phase_goal=(
-                f"Phase 3 goal for run_id='{state['run_id']}'.\n\n"
-                f"Business intent: {state['business_intent']}\n"
-                f"Bronze Parquet files: {state['bronze_output_paths']}\n"
-                f"Approved Silver STTM: {state['sttm_silver_path']}\n\n"
-                "You need to accomplish two things in this phase:\n"
-                "1. Execute the approved Silver cleansing rules to transform Bronze Parquet "
-                "files into cleansed Silver Parquet artifacts with surrogate keys.\n"
-                "2. Inspect the Silver outputs and generate a Gold STTM that defines how "
-                "Silver tables should be joined, renamed, aggregated, and shaped into "
-                "analytics-ready Gold target tables aligned to the business intent.\n\n"
-                "Think about which Silver tables need to be joined to answer the business "
-                "question, and what Gold table structure would best serve the Reporter agent. "
-                "Plan which tools to call and in what order. Verify each output before proceeding."
-            ),
-            phase_name="phase3",
+        output_paths = execute_silver(
+            input_files=state["bronze_output_paths"],
+            sttm_path=state["sttm_silver_path"],
             run_id=state["run_id"],
+            task_description=(
+                f"Run ID: {state['run_id']}\n"
+                f"Input Bronze files: {state['bronze_output_paths']}\n"
+                f"Approved Silver STTM: {state['sttm_silver_path']}\n"
+                "Inspect the Bronze Parquet schemas and STTM rules first. Plan the "
+                "cleansing approach for each column and file. Then execute cleansing "
+                "across all Bronze inputs, producing Silver Parquet outputs."
+            ),
         )
         state.update({
-            "silver_output_paths": scratchpad.get("silver_output_paths", []),
-            "sttm_gold_path": scratchpad.get("sttm_gold_path", ""),
-            "status": "awaiting_gold_sttm_approval",
+            "silver_output_paths": output_paths,
+            "status": "awaiting_silver_output_approval",
         })
         audit.log(
-            "orchestrator", "phase3_supervisor_completed",
-            status="success", phase="phase3",
-            silver_output_paths=scratchpad.get("silver_output_paths"),
-            sttm_gold_path=scratchpad.get("sttm_gold_path"),
+            "orchestrator", "silver_execution_completed",
+            status="success", phase="silver_execution",
+            silver_output_paths=output_paths,
         )
     except Exception as e:
         state.update({
-            "error": f"Phase 3 supervisor failed: {e}\n{traceback.format_exc()}",
+            "error": f"Silver execution failed: {e}\n{traceback.format_exc()}",
             "status": "failed",
         })
         audit.log(
-            "orchestrator", "phase3_supervisor_failed",
-            status="failed", phase="phase3", detail=str(e),
+            "orchestrator", "silver_execution_failed",
+            status="failed", phase="silver_execution", detail=str(e),
         )
 
     return state
 
 
-def run_gold_and_report(state: PipelineState) -> PipelineState:
-    """Phase 4: Supervisor executes Gold layer and generates the executive report.
+def run_gold_sttm_generation(state: PipelineState, user_feedback: str = "") -> PipelineState:
+    """Generate the Gold STTM directly from the approved Silver output.
+
+    UI contract: called by streamlit_app.py after Silver output approval.
+    user_feedback: optional note from the user about what the Silver output got
+    wrong, folded into the generation goal so the Gold STTM can account for it.
+    Returns PipelineState with sttm_gold_path populated, awaiting STTM approval.
+    """
+    audit = AuditLogger(state["run_id"])
+    state["error"] = ""
+
+    feedback_note = (
+        f"\nUser feedback on the Silver output to account for: {user_feedback.strip()}\n"
+        if user_feedback.strip() else ""
+    )
+
+    try:
+        audit.log(
+            "orchestrator", "gold_sttm_started",
+            status="in_progress", phase="gold_sttm",
+            rationale="User approved Silver output. Generating Gold STTM directly.",
+            user_feedback=user_feedback.strip(),
+        )
+        sttm_path = generate_gold_sttm(
+            silver_output_paths=state["silver_output_paths"],
+            silver_sttm_path=state["sttm_silver_path"],
+            business_intent=state["business_intent"],
+            run_id=state["run_id"],
+            task_description=(
+                f"Run ID: {state['run_id']}\n"
+                f"Layer: Gold\n"
+                f"Business intent: {state['business_intent']}\n"
+                f"Silver output files: {state['silver_output_paths']}\n"
+                f"Approved Silver STTM: {state['sttm_silver_path']}\n"
+                "Inspect the Silver Parquet metadata first. Plan join keys, column "
+                "renames, and aggregation rules. Build queryable analytics-ready tables "
+                "-- do NOT pre-aggregate for the business question. Add surrogate key "
+                "as the first row. Then generate the complete Gold STTM."
+                f"{feedback_note}"
+            ),
+        )
+        state.update({
+            "sttm_gold_path": sttm_path,
+            "status": "awaiting_gold_sttm_approval",
+        })
+        audit.log(
+            "orchestrator", "gold_sttm_completed",
+            status="success", phase="gold_sttm",
+            sttm_gold_path=sttm_path,
+        )
+    except Exception as e:
+        state.update({
+            "error": f"Gold STTM generation failed: {e}\n{traceback.format_exc()}",
+            "status": "failed",
+        })
+        audit.log(
+            "orchestrator", "gold_sttm_failed",
+            status="failed", phase="gold_sttm", detail=str(e),
+        )
+
+    return state
+
+
+def run_gold_execution(state: PipelineState) -> PipelineState:
+    """Execute the approved Gold STTM directly.
 
     UI contract: called by streamlit_app.py after Gold STTM approval.
-    Returns PipelineState with gold_output_paths and report_path populated.
+    Returns PipelineState with gold_output_paths populated, awaiting output approval.
     """
     audit = AuditLogger(state["run_id"])
     state["gold_sttm_approved"] = True
     state["error"] = ""
 
-    gold_t, reporter_t, scratchpad = _make_phase4_tools(
-        silver_output_paths=state["silver_output_paths"],
-        sttm_gold_path=state["sttm_gold_path"],
-        business_intent=state["business_intent"],
-        run_id=state["run_id"],
+    try:
+        audit.log(
+            "orchestrator", "gold_execution_started",
+            status="in_progress", phase="gold_execution",
+            rationale="User approved Gold STTM. Executing Gold materialisation directly.",
+        )
+        output_paths = execute_gold(
+            input_files=state["silver_output_paths"],
+            sttm_path=state["sttm_gold_path"],
+            run_id=state["run_id"],
+            task_description=(
+                f"Run ID: {state['run_id']}\n"
+                f"Input Silver files: {state['silver_output_paths']}\n"
+                f"Approved Gold STTM: {state['sttm_gold_path']}\n"
+                "Inspect the Silver Parquet schemas and Gold STTM rules first, grouped "
+                "by target table. Plan joins, renames, and aggregations per Gold table. "
+                "Then materialise all Gold target tables from the Silver inputs."
+            ),
+        )
+        state.update({
+            "gold_output_paths": output_paths,
+            "status": "awaiting_gold_output_approval",
+        })
+        audit.log(
+            "orchestrator", "gold_execution_completed",
+            status="success", phase="gold_execution",
+            gold_output_paths=output_paths,
+        )
+    except Exception as e:
+        state.update({
+            "error": f"Gold execution failed: {e}\n{traceback.format_exc()}",
+            "status": "failed",
+        })
+        audit.log(
+            "orchestrator", "gold_execution_failed",
+            status="failed", phase="gold_execution", detail=str(e),
+        )
+
+    return state
+
+
+def run_report_generation(state: PipelineState, user_feedback: str = "") -> PipelineState:
+    """Generate the executive report directly from the approved Gold output.
+
+    UI contract: called by streamlit_app.py after Gold output approval.
+    user_feedback: optional note from the user about what the Gold output got
+    wrong, folded into the generation goal so the report can account for it.
+    Returns PipelineState with report_path populated; pipeline complete.
+    """
+    audit = AuditLogger(state["run_id"])
+    state["error"] = ""
+
+    feedback_note = (
+        f"\nUser feedback on the Gold output to account for: {user_feedback.strip()}\n"
+        if user_feedback.strip() else ""
     )
 
     try:
         audit.log(
-            "orchestrator", "phase4_supervisor_started",
-            status="in_progress", phase="phase4",
-            rationale=(
-                "User approved Gold STTM. Supervisor will autonomously execute Gold "
-                "materialisation and generate the executive report."
-            ),
+            "orchestrator", "report_generation_started",
+            status="in_progress", phase="report_generation",
+            rationale="User approved Gold output. Generating executive report directly.",
+            user_feedback=user_feedback.strip(),
         )
-        _run_supervisor(
-            tools=[gold_t, reporter_t],
-            phase_goal=(
-                f"Phase 4 goal for run_id='{state['run_id']}'.\n\n"
-                f"Business intent: {state['business_intent']}\n"
-                f"Silver Parquet files: {state['silver_output_paths']}\n"
-                f"Approved Gold STTM: {state['sttm_gold_path']}\n\n"
-                "You need to accomplish two things in this phase:\n"
-                "1. Execute the approved Gold materialisation rules to produce analytics-ready "
-                "Gold Parquet tables from the Silver inputs, applying all approved joins, "
-                "renames, and aggregations.\n"
-                "2. Dispatch the Reporter agent to inspect the Gold tables, write SQL to "
-                "directly answer the business question, and produce a self-contained HTML "
-                "executive report with visual evidence (charts).\n\n"
-                "Think about what the business question needs and whether the Gold tables "
-                "are structured to answer it. Verify the Gold tables are populated before "
-                "dispatching the Reporter. "
-                "Plan which tools to call and in what order. Verify each output before proceeding."
-            ),
-            phase_name="phase4",
+        report_path = generate_report(
+            gold_files=state["gold_output_paths"],
+            business_intent=state["business_intent"],
             run_id=state["run_id"],
+            task_description=(
+                f"Run ID: {state['run_id']}\n"
+                f"Business question: {state['business_intent']}\n"
+                f"Gold files: {state['gold_output_paths']}\n"
+                "Inspect the Gold tables first to understand their structure. Plan your "
+                "SQL approach to directly answer the business question. Load the tables, "
+                "execute your query, analyse results, and produce a structured HTML report "
+                "with charts that provide visual evidence for your answer."
+                f"{feedback_note}"
+            ),
         )
         state.update({
-            "gold_output_paths": scratchpad.get("gold_output_paths", []),
-            "report_path": scratchpad.get("report_path", ""),
+            "report_path": report_path,
             "status": "completed",
         })
         audit.log(
-            "orchestrator", "phase4_supervisor_completed",
-            status="success", phase="phase4",
-            gold_output_paths=scratchpad.get("gold_output_paths"),
-            report_path=scratchpad.get("report_path"),
+            "orchestrator", "report_generation_completed",
+            status="success", phase="report_generation",
+            report_path=report_path,
         )
     except Exception as e:
         state.update({
-            "error": f"Phase 4 supervisor failed: {e}\n{traceback.format_exc()}",
+            "error": f"Report generation failed: {e}\n{traceback.format_exc()}",
             "status": "failed",
         })
         audit.log(
-            "orchestrator", "phase4_supervisor_failed",
-            status="failed", phase="phase4", detail=str(e),
+            "orchestrator", "report_generation_failed",
+            status="failed", phase="report_generation", detail=str(e),
         )
 
     return state

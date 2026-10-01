@@ -26,7 +26,8 @@ import pandas as pd
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
-from core.config import STTM_DIR, LLM_PROVIDER, GROQ_API_KEY, GROQ_MODEL, GOOGLE_API_KEY, GEMINI_MODEL
+from core.config import STTM_DIR
+from core.llm import make_llm
 from core.audit import AuditLogger
 from core.observability import AgentTrace
 
@@ -90,6 +91,8 @@ which STTM generation tool is appropriate, execute it, and verify the output.
 - Add metadata rows: _load_timestamp ("Current UTC timestamp injected at load time")
   and _source_file ("Source file path injected at load time").
 - Do NOT add a surrogate key — that belongs in Silver.
+- Data-column transformation_logic: exactly one or more of Passthrough, Cast to
+  text, Cast to integer, Cast to float, Cast to date (combine with "; ").
 - Each row: source_schema, source_table, source_column, target_schema, target_table,
   target_column, transformation_type, transformation_logic.
 
@@ -97,8 +100,11 @@ which STTM generation tool is appropriate, execute it, and verify the output.
 - FIRST row must be the surrogate key: source_column="" (empty), target_column=
   "pk_<table_stem>_silver_id", transformation_type="Indirect",
   transformation_logic="Auto-generated sequential surrogate primary key starting from 1".
-- Apply null handling (drop/fill mean/median/mode/constant), deduplication, type
-  casting, date standardisation to YYYY-MM-DD, text normalisation (strip, lower, etc.).
+- Data-column transformation_logic: exactly one or more of Passthrough, Drop
+  nulls, Fill nulls (mean), Fill nulls (median), Fill nulls (mode), Fill nulls
+  (constant), Deduplicate, Cast to text, Cast to integer, Cast to float,
+  Cast to date, Lowercase, Uppercase, Title case, Strip whitespace (combine
+  with "; ").
 - For id columns: type casting ONLY — no null handling.
 - Same row structure as Bronze.
 
@@ -107,7 +113,9 @@ which STTM generation tool is appropriate, execute it, and verify the output.
   "pk_gold_id", transformation_type="Indirect",
   transformation_logic="Auto-generated sequential surrogate primary key starting from 1".
 - Join Silver tables on matching key columns where applicable.
-- Use "Direct" / "Passthrough" for columns needing no transformation.
+- Data-column transformation_logic: exactly one of Passthrough, Sum, Average,
+  Count, Max, Min, or a single CASE WHEN ... END expression for a
+  renamed/derived column.
 - Build queryable tables — do NOT pre-aggregate for the business question.
 - Same row structure as Bronze.
 
@@ -117,7 +125,56 @@ which STTM generation tool is appropriate, execute it, and verify the output.
 - Output format from generation tools is JSON; read it for confirmation.
 - Bronze and Silver are intent-agnostic: do NOT filter, prioritise, or shape
   rules based on any business question. Map every column mechanically.
-- Gold is intent-driven: shape target tables to serve the business intent."""
+- Gold is intent-driven: shape target tables to serve the business intent.
+- For every data-column row, transformation_logic must use ONLY the exact
+  canonical phrases the generation tool's own instructions list for that
+  layer (combine more than one with "; " on a single row). Do not write
+  free-form descriptions for data columns — the execution agents match on
+  these exact phrases, not on loose keyword search, so any other wording
+  is silently treated as a no-op passthrough."""
+
+
+# ---------------------------------------------------------------------------
+# Canonical transformation_logic vocabulary
+# ---------------------------------------------------------------------------
+# Execution agents (bronze_agent, silver_agent, gold_agent) used to detect what
+# a row's transformation_logic prose asked for via loose substring checks (e.g.
+# "sum" in logic), which can misfire on legitimate free text that happens to
+# contain a trigger word -- this bit us once already (a CASE WHEN branch whose
+# literal text contained "sum" would have been wrongly treated as an
+# aggregation). The STTM generator is instructed to write ONLY these exact
+# phrases (joined with "; " when a row combines more than one), and execution
+# agents match fragments against this same closed vocabulary instead of raw
+# substring search -- single source of truth so the prompt and the executor
+# can never drift apart.
+
+BRONZE_LOGIC_TAGS = frozenset({
+    "passthrough", "rename", "cast to text", "cast to integer", "cast to float", "cast to date",
+})
+
+SILVER_LOGIC_TAGS = frozenset({
+    "passthrough", "rename", "drop nulls", "fill nulls (mean)", "fill nulls (median)",
+    "fill nulls (mode)", "fill nulls (constant)", "deduplicate",
+    "cast to text", "cast to integer", "cast to float", "cast to date",
+    "lowercase", "uppercase", "title case", "strip whitespace",
+})
+
+GOLD_LOGIC_TAGS = frozenset({
+    "passthrough", "rename", "sum", "average", "count", "max", "min",
+})
+
+
+def parse_logic_tags(raw_logic: str) -> set[str]:
+    """Split a transformation_logic cell into its canonical tag fragments.
+
+    Rows combine more than one operation by separating tags with "; " (e.g.
+    "Fill nulls (mean); Cast to float"). Returns the lowercased, stripped
+    fragments -- callers compare against their layer's *_LOGIC_TAGS constant.
+    A CASE WHEN expression or any other free-form text simply won't match
+    anything in that vocabulary; callers that special-case CASE WHEN should
+    check for it before consulting this.
+    """
+    return {frag.strip().lower() for frag in raw_logic.split(";") if frag.strip()}
 
 
 # ---------------------------------------------------------------------------
@@ -207,18 +264,6 @@ def _extract_sttm_rows(result: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# LLM factory
-# ---------------------------------------------------------------------------
-
-def _make_llm():
-    if LLM_PROVIDER == "groq":
-        from langchain_groq import ChatGroq
-        return ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL)
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model=GEMINI_MODEL)
-
-
-# ---------------------------------------------------------------------------
 # Unified tool factory — all 4 tools built from the caller's context
 # ---------------------------------------------------------------------------
 
@@ -281,12 +326,15 @@ def _make_sttm_tools(
             f"Profile context:\n{context_tool_result[:6000]}\n\n"
             "Bronze is intent-agnostic: cover EVERY source column mechanically — "
             "do not filter, prioritise, or omit any column based on perceived relevance.\n"
+            "For each data-column row's transformation_logic, use ONLY one of these exact "
+            "phrases (combine more than one on a row with '; '): Passthrough, Cast to text, "
+            "Cast to integer, Cast to float, Cast to date. Do not write free-form descriptions.\n"
             "Return ONLY a valid JSON array of STTM rows. Each row must have: "
             "source_schema, source_table, source_column, target_schema, target_table, "
             "target_column, transformation_type, transformation_logic. "
             "No markdown fences, no prose."
         )
-        llm = _make_llm()
+        llm = make_llm()
         response = llm.invoke(inner_prompt)
         raw = response.content if hasattr(response, "content") else str(response)
         # Strip fences if present
@@ -343,14 +391,19 @@ def _make_sttm_tools(
             "- Silver maps EVERY Bronze column; do NOT filter or prioritise.\n"
             "- First row must be the surrogate key: source_column='', target_column='pk_<stem>_silver_id', "
             "transformation_type='Indirect', transformation_logic='Auto-generated sequential surrogate primary key starting from 1'.\n"
-            "- Apply null handling, type casting, deduplication, and date standardisation. For id columns: type casting only.\n"
+            "- For every OTHER (data column) row, transformation_logic must use ONLY these exact "
+            "phrases, combined with '; ' if a column needs more than one: Passthrough, Drop nulls, "
+            "Fill nulls (mean), Fill nulls (median), Fill nulls (mode), Fill nulls (constant), "
+            "Deduplicate, Cast to text, Cast to integer, Cast to float, Cast to date, Lowercase, "
+            "Uppercase, Title case, Strip whitespace. Do not write free-form descriptions.\n"
+            "- For id columns: use 'Cast to text' or 'Cast to integer' only -- never a null-handling phrase.\n"
             "Output format instructions:\n"
             "- Return ONLY a valid JSON array (e.g. [{...}, {...}]).\n"
             "- Each row must include these fields: source_schema, source_table, source_column, target_schema, target_table, target_column, transformation_type, transformation_logic.\n"
             "- Do NOT include markdown fences, prose, or any function/tool-call-like syntax.\n"
             "- Do NOT include run_id, file paths, or other metadata in the JSON rows.\n"
         )
-        llm = _make_llm()
+        llm = make_llm()
         response = llm.invoke(inner_prompt)
         raw = response.content if hasattr(response, "content") else str(response)
         if "```json" in raw:
@@ -401,7 +454,10 @@ def _make_sttm_tools(
             "- First row must be the surrogate key: source_column='', target_column='pk_gold_id', transformation_type='Indirect', "
             "  transformation_logic='Auto-generated sequential surrogate primary key starting from 1'.\n"
             "- Join Silver tables on matching key columns where required to answer the business intent.\n"
-            "- Use Direct/Passthrough for columns needing no transformation; use Indirect for renamed/derived columns.\n"
+            "- For every OTHER (data column) row, transformation_logic must be ONE of: Passthrough, "
+            "Sum, Average, Count, Max, Min, or a single CASE WHEN <col> <op> <value> THEN <value> "
+            "[WHEN ...] ELSE <value> END expression for a renamed/derived column. Do not write "
+            "free-form descriptions.\n"
             "Output format instructions:\n"
             "- Return ONLY a valid JSON array (e.g. [{...}, {...}]).\n"
             "- Each row must include these fields: source_schema, source_table, source_column, target_schema, target_table, target_column, transformation_type, transformation_logic.\n"
@@ -410,7 +466,7 @@ def _make_sttm_tools(
             "- If multiple Silver tables are relevant, include join rules (source_table, source_column -> target_table, target_column) as STTM rows so the Reporter can join tables.\n"
             "- Prefer completeness for intent-serving columns: include them even if you think they may be redundant.\n"
         )
-        llm = _make_llm()
+        llm = make_llm()
         response = llm.invoke(inner_prompt)
         raw = response.content if hasattr(response, "content") else str(response)
         if "```json" in raw:
@@ -456,7 +512,7 @@ def _run_sttm_agent(
     audit = AuditLogger(run_id)
     audit.log("sttm_generator", audit_action, **audit_kwargs)
 
-    llm = _make_llm()
+    llm = make_llm()
     agent = create_agent(llm, tools, system_prompt=STTM_AGENT_PROMPT)
 
     try:

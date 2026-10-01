@@ -105,7 +105,7 @@ class TestMakeReporterTools:
         p = tmp_path / "gold_sales.parquet"
         df.to_parquet(str(p), index=False)
 
-        load_tool, _, scratchpad, conn = _make_reporter_tools([str(p)], "run-r1")
+        _, load_tool, _, scratchpad, conn = _make_reporter_tools([str(p)], "run-r1")
         try:
             result = load_tool.invoke({})
             catalog = json.loads(result)
@@ -120,7 +120,7 @@ class TestMakeReporterTools:
         p = tmp_path / "gold_data.parquet"
         df.to_parquet(str(p), index=False)
 
-        load_tool, query_tool, scratchpad, conn = _make_reporter_tools([str(p)], "run-r2")
+        _, load_tool, query_tool, scratchpad, conn = _make_reporter_tools([str(p)], "run-r2")
         try:
             load_tool.invoke({})
             query_tool.invoke({"sql_query": "SELECT * FROM gold_data"})
@@ -135,7 +135,7 @@ class TestMakeReporterTools:
         p = tmp_path / "gold_x.parquet"
         df.to_parquet(str(p), index=False)
 
-        load_tool, query_tool, scratchpad, conn = _make_reporter_tools([str(p)], "run-r3")
+        _, load_tool, query_tool, scratchpad, conn = _make_reporter_tools([str(p)], "run-r3")
         try:
             load_tool.invoke({})
             result = query_tool.invoke({"sql_query": "SELECT * FROM nonexistent_table"})

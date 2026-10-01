@@ -9,6 +9,8 @@ I/O contract (UNCHANGED — UI and orchestrator safe):
 """
 
 import json
+import re
+from types import SimpleNamespace
 import pandas as pd
 import duckdb
 import plotly.graph_objects as go
@@ -17,7 +19,8 @@ from pathlib import Path
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
-from core.config import LLM_PROVIDER, GROQ_API_KEY, GROQ_MODEL, GOOGLE_API_KEY, GEMINI_MODEL, REPORTS_DIR
+from core.config import LLM_PROVIDER, REPORTS_DIR
+from core.llm import make_llm
 from core.audit import AuditLogger
 from core.observability import AgentTrace
 from core.memory import store_document
@@ -61,8 +64,10 @@ tables, form an analytical plan, write and execute SQL, and return structured an
   sample data. Call this before execute_query_tool.
 
 - **execute_query_tool**: Executes a SQL SELECT query against the loaded Gold tables
-  in DuckDB. Pass your SQL as the sql_query parameter. Returns query results as a
-  JSON array. On error returns {"error": "..."}.
+  in DuckDB. Pass your SQL as the sql_query parameter. Only a single read-only SELECT
+  statement (optionally starting with WITH for a CTE) is accepted -- any other
+  statement type, or multiple statements, is rejected before execution. Returns
+  query results as a JSON array. On error returns {"error": "..."}.
 
 ## Output format
 Return ONLY a valid JSON object — no markdown fences, no prose:
@@ -92,7 +97,11 @@ Return ONLY a valid JSON object — no markdown fences, no prose:
 - Use ACTUAL column names from the query result — not from the original Gold tables.
 - Be specific with numbers in the direct_answer.
 - Write standard ANSI SQL compatible with DuckDB.
-- If execute_query_tool returns an error, fix the SQL and retry once."""
+- If execute_query_tool returns an error, fix the SQL and retry once.
+- This final JSON object must be plain assistant text content, NOT a tool call or function
+  call. Do not invoke any tool (including one named "json") to produce it — once
+  execute_query_tool has returned results, you are done with tools; just write the JSON
+  directly as your message text."""
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +126,39 @@ def _inspect_gold_tables(gold_files: list[str]) -> dict:
         except Exception as e:
             summary[Path(fp).stem] = {"file": fp, "error": str(e)}
     return summary
+
+
+_DISALLOWED_SQL_KEYWORDS_RE = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|ATTACH|DETACH|COPY|EXPORT|"
+    r"IMPORT|INSTALL|LOAD|CALL|VACUUM|GRANT|REVOKE|REPLACE)\b",
+    re.IGNORECASE,
+)
+
+
+def _validate_select_only(sql_query: str) -> str | None:
+    """Return an error message if sql_query isn't a single read-only SELECT statement, else None.
+
+    The Reporter only ever needs to read Gold tables -- there's no legitimate reason
+    for its LLM-written SQL to touch DDL/DML. Strips comments first so they can't hide
+    a second statement or a disallowed keyword from the checks below.
+    """
+    no_block_comments = re.sub(r"/\*.*?\*/", " ", sql_query, flags=re.DOTALL)
+    no_comments = re.sub(r"--[^\n]*", " ", no_block_comments)
+
+    statements = [s.strip() for s in no_comments.split(";") if s.strip()]
+    if not statements:
+        return "Empty query."
+    if len(statements) > 1:
+        return "Only a single SELECT statement is allowed -- multiple statements were provided."
+
+    statement = statements[0]
+    if not re.match(r"^(SELECT|WITH)\b", statement, re.IGNORECASE):
+        return "Only SELECT queries are allowed (optionally starting with WITH for a CTE)."
+
+    if _DISALLOWED_SQL_KEYWORDS_RE.search(statement):
+        return "Query contains a disallowed keyword -- only read-only SELECT queries are permitted."
+
+    return None
 
 
 def generate_chart_from_spec(df: pd.DataFrame, chart_spec: dict, chart_id: int) -> str:
@@ -166,6 +208,15 @@ def generate_chart_from_spec(df: pd.DataFrame, chart_spec: dict, chart_id: int) 
         return ""
 
 
+def generate_key_metrics(df: pd.DataFrame) -> dict:
+    """Compute basic dataset-level metrics for the report's summary strip."""
+    return {
+        "total_rows": len(df),
+        "total_columns": len(df.columns),
+        "missing_values": int(df.isnull().sum().sum()),
+    }
+
+
 def _extract_analysis(result: dict) -> dict:
     """Scan agent message history (reverse order) for a JSON object with 'direct_answer' key."""
     for msg in reversed(result.get("messages", [])):
@@ -187,6 +238,34 @@ def _extract_analysis(result: dict) -> dict:
         except (json.JSONDecodeError, ValueError):
             continue
     return {}
+
+
+def _invoke_agent_with_json_tool_recovery(agent, messages_input: dict) -> dict:
+    """Invoke the agent, recovering from a Groq-specific phantom tool call.
+
+    Some Groq-hosted models (observed with openai/gpt-oss-*) occasionally emit a
+    tool call named "json"/"JSON" instead of writing their final JSON answer as
+    plain text, even when explicitly instructed not to. Groq rejects that call
+    with a 400 and echoes the intended payload back in `failed_generation` — the
+    content is correct, it's just mis-wrapped as a disallowed tool call. Recover
+    it rather than letting the whole phase fail.
+    """
+    try:
+        return agent.invoke(messages_input)
+    except Exception as e:
+        body = getattr(e, "body", None)
+        if not isinstance(body, dict):
+            raise
+        error = body.get("error", {})
+        if error.get("code") != "tool_use_failed":
+            raise
+        try:
+            recovered = json.loads(error.get("failed_generation", ""))
+            arguments = recovered["arguments"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            raise
+        print("[REPORTER] Recovered final answer from a rejected phantom tool call")
+        return {"messages": [SimpleNamespace(content=json.dumps(arguments))]}
 
 
 # ---------------------------------------------------------------------------
@@ -235,10 +314,16 @@ def _make_reporter_tools(gold_files: list[str], run_id: str):
     def execute_query_tool(sql_query: str) -> str:
         """Execute a SQL SELECT query against the loaded Gold tables in DuckDB.
 
-        Call this after load_gold_data_tool. Pass your SQL as sql_query.
+        Call this after load_gold_data_tool. Pass your SQL as sql_query. Only a
+        single read-only SELECT statement (optionally with a WITH/CTE prefix) is
+        permitted -- any other statement type, or multiple statements, is rejected
+        before execution.
         Returns the query result as a JSON array of records (up to 100 rows).
         On SQL error returns {"error": "..."} — fix the SQL and retry once.
         """
+        validation_error = _validate_select_only(sql_query)
+        if validation_error:
+            return json.dumps({"error": validation_error})
         try:
             result_df = conn.execute(sql_query).fetchdf()
             scratchpad["result_df"] = result_df
@@ -248,18 +333,6 @@ def _make_reporter_tools(gold_files: list[str], run_id: str):
             return json.dumps({"error": str(e)})
 
     return inspect_gold_tables_tool, load_gold_data_tool, execute_query_tool, scratchpad, conn
-
-
-# ---------------------------------------------------------------------------
-# LLM factory
-# ---------------------------------------------------------------------------
-
-def _make_llm():
-    if LLM_PROVIDER == "groq":
-        from langchain_groq import ChatGroq
-        return ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL)
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model=GEMINI_MODEL)
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +372,7 @@ def generate_report(
         return ""
 
     inspect_tool, load_tool, query_tool, scratchpad, conn = _make_reporter_tools(gold_files, run_id)
-    llm = _make_llm()
+    llm = make_llm()
 
     print(f"[REPORTER] Running autonomous ReAct agent ({LLM_PROVIDER})")
     agent = create_agent(
@@ -309,7 +382,9 @@ def generate_report(
     )
 
     try:
-        result = agent.invoke({"messages": [HumanMessage(content=task_description)]})
+        result = _invoke_agent_with_json_tool_recovery(
+            agent, {"messages": [HumanMessage(content=task_description)]}
+        )
     except Exception as e:
         trace.fail(str(e))
         conn.close()
@@ -327,7 +402,7 @@ def generate_report(
 
     # Fallback: agent did not call execute_query_tool or query returned nothing
     if result_df is None or result_df.empty:
-        print("[REPORTER] No query result in scratchpad — falling back to combined gold data")
+        print("[REPORTER] No query result in scratchpad - falling back to combined gold data")
         fallback_dfs = [pd.read_parquet(fp) for fp in gold_files]
         result_df = pd.concat(fallback_dfs, ignore_index=True) if fallback_dfs else pd.DataFrame()
         query_code = "-- Fallback: combined all Gold tables"
@@ -346,6 +421,21 @@ def generate_report(
         }
 
     print(f"[REPORTER] Query result: {result_df.shape[0]} rows x {result_df.shape[1]} columns")
+
+    key_metrics = generate_key_metrics(result_df)
+    metrics_html = "\n".join(
+        f"""
+        <div class="metric-tile">
+            <div class="metric-value">{value}</div>
+            <div class="metric-label">{label}</div>
+        </div>
+        """
+        for label, value in [
+            ("Rows Returned", key_metrics["total_rows"]),
+            ("Columns", key_metrics["total_columns"]),
+            ("Missing Values", key_metrics["missing_values"]),
+        ]
+    )
 
     # Generate charts from agent-specified chart specs
     charts_html = []
@@ -422,6 +512,21 @@ def generate_report(
                 border-left: 4px solid #28a745;
             }}
             .answer-section p {{ margin: 0; line-height: 1.6; font-size: 16px; color: #333; }}
+            .metrics-grid {{
+                display: flex;
+                gap: 16px;
+                flex-wrap: wrap;
+            }}
+            .metric-tile {{
+                flex: 1 1 140px;
+                background: #f8f9fc;
+                border: 1px solid #e3e6f0;
+                border-radius: 8px;
+                padding: 16px;
+                text-align: center;
+            }}
+            .metric-value {{ font-size: 28px; font-weight: 700; color: #667eea; }}
+            .metric-label {{ font-size: 13px; color: #777; margin-top: 4px; }}
             .approach-section {{ margin: 20px 0; }}
             .approach-section h3 {{ color: #667eea; font-size: 16px; margin: 20px 0 10px 0; }}
             .code-block {{
@@ -458,6 +563,12 @@ def generate_report(
             {answer_html}
         </div>
         <div class="section">
+            <h2>&#128200; Key Metrics</h2>
+            <div class="metrics-grid">
+                {metrics_html}
+            </div>
+        </div>
+        <div class="section">
             <h2>&#128202; Approach &amp; Query</h2>
             {approach_html}
         </div>
@@ -476,7 +587,7 @@ def generate_report(
     """
 
     report_path = str(REPORTS_DIR / f"report_{run_id[:8]}.html")
-    print(f"[REPORTER] Saving HTML report → {report_path}")
+    print(f"[REPORTER] Saving HTML report -> {report_path}")
     with open(report_path, "w", encoding="utf-8") as f:
         f.write(full_html)
 
@@ -492,5 +603,5 @@ def generate_report(
 
     audit.log("reporter", "completed", report_path=report_path)
     trace.set_output(report_path=report_path).complete()
-    print(f"[REPORTER] Done — {report_path}")
+    print(f"[REPORTER] Done - {report_path}")
     return report_path

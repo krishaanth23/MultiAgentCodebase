@@ -9,13 +9,16 @@ I/O contract:
 """
 
 import os
+import re
 import json
 import pandas as pd
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
-from core.config import GOLD_DIR, LLM_PROVIDER, GROQ_API_KEY, GROQ_MODEL, GOOGLE_API_KEY, GEMINI_MODEL
+from core.config import GOLD_DIR, LLM_PROVIDER
+from core.llm import make_llm
 from core.audit import AuditLogger
+from agents.sttm_generator import GOLD_LOGIC_TAGS, parse_logic_tags
 from core.observability import AgentTrace
 
 
@@ -114,6 +117,55 @@ def _inspect_task(input_files: list[str], sttm_path: str) -> dict:
     }
 
 
+_CASE_WHEN_RE = re.compile(
+    r"when\s+[\w.]+\s*(?P<op>=|==|!=|<>|>=|<=|>|<)\s*'?(?P<val>[^'\s]+?)'?\s+then\s+'?(?P<then>[^'\s]+?)'?"
+    r"(?=\s+when\b|\s+else\b|\s+end\b|$)",
+    re.IGNORECASE,
+)
+_CASE_ELSE_RE = re.compile(r"else\s+'?(?P<else>[^'\s]+?)'?\s*end\b", re.IGNORECASE)
+
+
+def _coerce_case_literal(raw: str):
+    """Parse a CASE WHEN literal as int/float when possible, else keep it as a string."""
+    try:
+        return float(raw) if "." in raw else int(raw)
+    except ValueError:
+        return raw
+
+
+def _eval_case_when(series: pd.Series, logic: str):
+    """Evaluate a 'CASE WHEN <col> <op> <val> THEN <val> [WHEN ...] ELSE <val> END' expression.
+
+    Only the comparison operator/value/result are parsed from each WHEN clause — the
+    column name itself is assumed to be the rule's own source column (`series`).
+    Returns a new Series, or None if `logic` isn't a CASE WHEN expression at all.
+    """
+    if "case" not in logic.lower() or "when" not in logic.lower():
+        return None
+    whens = list(_CASE_WHEN_RE.finditer(logic))
+    if not whens:
+        return None
+
+    result = pd.Series([None] * len(series), index=series.index, dtype=object)
+    for m in reversed(whens):  # reversed so the first-listed WHEN wins on overlap, per SQL semantics
+        op = m.group("op")
+        val = _coerce_case_literal(m.group("val"))
+        then_val = _coerce_case_literal(m.group("then"))
+        if op in ("=", "=="):
+            mask = series.astype(str) == str(val)
+        elif op in ("!=", "<>"):
+            mask = series.astype(str) != str(val)
+        else:
+            numeric = pd.to_numeric(series, errors="coerce")
+            mask = {">": numeric > val, "<": numeric < val, ">=": numeric >= val, "<=": numeric <= val}[op]
+        result[mask] = then_val
+
+    else_match = _CASE_ELSE_RE.search(logic)
+    if else_match:
+        result[result.isna()] = _coerce_case_literal(else_match.group("else"))
+    return result
+
+
 def _apply_gold_rules(
     input_files: list[str], sttm_path: str, run_id: str
 ) -> list[str]:
@@ -176,44 +228,52 @@ def _apply_gold_rules(
                 else:
                     df = pd.concat([df, source_df], ignore_index=True, sort=False)
 
-        # Apply transformations
+        # Apply transformations. Each STTM row builds its own target_col independently
+        # (rather than a single shared rename dict) so one source column can fan out
+        # into several target columns — e.g. a passthrough copy plus a CASE-derived one.
         group_by_cols: list[str] = []
         agg_map: dict[str, str] = {}
-        rename_map: dict[str, str] = {}
 
         for _, rule in table_rules.iterrows():
             source_col = str(rule.get("source_column", "")).strip()
             target_col = str(rule.get("target_column", "")).strip()
-            logic = str(rule.get("transformation_logic", "")).lower()
+            raw_logic = str(rule.get("transformation_logic", ""))
+            logic = raw_logic.lower()
             transformation_type = str(rule.get("transformation_type", "")).lower()
 
-            if source_col and target_col and source_col in df.columns and source_col != target_col:
-                rename_map[source_col] = target_col
+            if not (source_col and target_col and source_col in df.columns):
+                continue
 
-            if source_col and source_col in df.columns and (
-                transformation_type == "direct" or "group by" in logic
-            ):
-                if source_col not in group_by_cols:
-                    group_by_cols.append(source_col)
+            case_result = _eval_case_when(df[source_col], raw_logic)
+            if case_result is not None:
+                df[target_col] = case_result
+            elif target_col != source_col:
+                df[target_col] = df[source_col]
+            # else: passthrough with no rename — target_col already exists as-is.
 
-            if source_col and source_col in df.columns:
-                if "sum" in logic:
-                    agg_map[source_col] = "sum"
-                elif "average" in logic or "avg" in logic or "mean" in logic:
-                    agg_map[source_col] = "mean"
-                elif "count" in logic:
-                    agg_map[source_col] = "count"
-                elif "max" in logic:
-                    agg_map[source_col] = "max"
-                elif "min" in logic:
-                    agg_map[source_col] = "min"
+            if transformation_type == "direct":
+                if target_col not in group_by_cols:
+                    group_by_cols.append(target_col)
 
-        if rename_map:
-            valid_renames = {s: t for s, t in rename_map.items() if s in df.columns}
-            if valid_renames:
-                df = df.rename(columns=valid_renames)
-                group_by_cols = [rename_map.get(col, col) for col in group_by_cols]
-                agg_map = {rename_map.get(col, col): func for col, func in agg_map.items()}
+            # A CASE WHEN expression is its own row type, already handled above --
+            # don't also tag-match it for aggregation (its branch literals could
+            # coincidentally contain a word like "sum" without meaning to aggregate).
+            if case_result is None:
+                tags = parse_logic_tags(logic)
+                if tags and not (tags & GOLD_LOGIC_TAGS):
+                    print(f"[GOLD] Unrecognised transformation_logic {logic!r} for column "
+                          f"'{target_col}' -- treating as passthrough.")
+
+                if "sum" in tags:
+                    agg_map[target_col] = "sum"
+                elif "average" in tags:
+                    agg_map[target_col] = "mean"
+                elif "count" in tags:
+                    agg_map[target_col] = "count"
+                elif "max" in tags:
+                    agg_map[target_col] = "max"
+                elif "min" in tags:
+                    agg_map[target_col] = "min"
 
         valid_group_by = [col for col in group_by_cols if col in df.columns]
         valid_agg_map = {col: func for col, func in agg_map.items() if col in df.columns}
@@ -291,18 +351,6 @@ def _make_gold_tools(
 
 
 # ---------------------------------------------------------------------------
-# LLM factory
-# ---------------------------------------------------------------------------
-
-def _make_llm():
-    if LLM_PROVIDER == "groq":
-        from langchain_groq import ChatGroq
-        return ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL)
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model=GEMINI_MODEL)
-
-
-# ---------------------------------------------------------------------------
 # Public entry point — I/O contract UNCHANGED
 # ---------------------------------------------------------------------------
 
@@ -332,7 +380,7 @@ def execute_gold(
     trace.set_input(input_files=input_files, sttm_path=sttm_path)
 
     inspect_tool, ingestion_tool = _make_gold_tools(input_files, sttm_path, run_id)
-    llm = _make_llm()
+    llm = make_llm()
 
     print(f"[GOLD] Running autonomous ReAct agent ({LLM_PROVIDER})")
     agent = create_agent(llm, [inspect_tool, ingestion_tool], system_prompt=GOLD_AGENT_PROMPT)

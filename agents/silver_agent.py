@@ -14,9 +14,11 @@ import pandas as pd
 from langchain_core.tools import tool
 from langchain_core.messages import HumanMessage
 from langchain.agents import create_agent
-from core.config import SILVER_DIR, LLM_PROVIDER, GROQ_API_KEY, GROQ_MODEL, GOOGLE_API_KEY, GEMINI_MODEL
+from core.config import SILVER_DIR, LLM_PROVIDER
+from core.llm import make_llm
 from core.audit import AuditLogger
 from core.observability import AgentTrace
+from agents.sttm_generator import SILVER_LOGIC_TAGS, parse_logic_tags
 
 
 SILVER_AGENT_PROMPT = """You are an autonomous Data Quality Engineer specialising in the Silver layer of a
@@ -166,7 +168,12 @@ def _apply_silver_rules(input_files: list[str], sttm_path: str, run_id: str) -> 
 
             working_col = target_col if target_col in df.columns else source_col
 
-            if "deduplic" in logic:
+            tags = parse_logic_tags(logic)
+            if tags and not (tags & SILVER_LOGIC_TAGS):
+                print(f"[SILVER] Unrecognised transformation_logic {logic!r} for column "
+                      f"'{working_col}' -- treating as passthrough.")
+
+            if "deduplicate" in tags:
                 subset = [working_col] if working_col in df.columns else None
                 df = df.drop_duplicates(subset=subset)
                 continue
@@ -175,24 +182,24 @@ def _apply_silver_rules(input_files: list[str], sttm_path: str, run_id: str) -> 
                 continue
 
             try:
-                if "drop null" in logic or "remove null" in logic:
+                if "drop nulls" in tags:
                     df = df.dropna(subset=[working_col])
-                elif "fill null" in logic and "mean" in logic:
+                elif "fill nulls (mean)" in tags:
                     df[working_col] = df[working_col].fillna(
                         pd.to_numeric(df[working_col], errors="coerce").mean()
                     )
-                elif "fill null" in logic and "median" in logic:
+                elif "fill nulls (median)" in tags:
                     df[working_col] = df[working_col].fillna(
                         pd.to_numeric(df[working_col], errors="coerce").median()
                     )
-                elif "fill null" in logic and "mode" in logic:
+                elif "fill nulls (mode)" in tags:
                     mode_val = df[working_col].mode()
                     if not mode_val.empty:
                         df[working_col] = df[working_col].fillna(mode_val.iloc[0])
-                elif "fill null" in logic or "default" in logic:
+                elif "fill nulls (constant)" in tags:
                     df[working_col] = df[working_col].fillna("")
 
-                if "date" in logic or "datetime" in logic:
+                if "cast to date" in tags:
                     _date_fmts = [
                         "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y",
                         "%Y%m%d", "%d-%b-%Y", "%d-%B-%Y",
@@ -211,21 +218,21 @@ def _apply_silver_rules(input_files: list[str], sttm_path: str, run_id: str) -> 
                     df[working_col] = _parsed if _parsed is not None else pd.to_datetime(
                         df[working_col], errors="coerce"
                     )
-                elif "integer" in logic:
+                elif "cast to integer" in tags:
                     df[working_col] = pd.to_numeric(df[working_col], errors="coerce").astype("Int64")
-                elif "float" in logic or "decimal" in logic or "numeric" in logic:
+                elif "cast to float" in tags:
                     df[working_col] = pd.to_numeric(df[working_col], errors="coerce")
-                elif "text" in logic:
+                elif "cast to text" in tags:
                     df[working_col] = df[working_col].astype(str)
 
-                if "lowercase" in logic:
+                if "lowercase" in tags:
                     df[working_col] = df[working_col].astype(str).str.lower()
-                elif "uppercase" in logic:
+                elif "uppercase" in tags:
                     df[working_col] = df[working_col].astype(str).str.upper()
-                elif "title case" in logic:
+                elif "title case" in tags:
                     df[working_col] = df[working_col].astype(str).str.title()
 
-                if "strip" in logic or "trim" in logic:
+                if "strip whitespace" in tags:
                     df[working_col] = df[working_col].astype(str).str.strip()
             except (ValueError, TypeError):
                 pass
@@ -300,18 +307,6 @@ def _make_silver_tools(input_files: list[str], sttm_path: str, run_id: str):
 
 
 # ---------------------------------------------------------------------------
-# LLM factory
-# ---------------------------------------------------------------------------
-
-def _make_llm():
-    if LLM_PROVIDER == "groq":
-        from langchain_groq import ChatGroq
-        return ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL)
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    return ChatGoogleGenerativeAI(api_key=GOOGLE_API_KEY, model=GEMINI_MODEL)
-
-
-# ---------------------------------------------------------------------------
 # Public entry point — I/O contract UNCHANGED
 # ---------------------------------------------------------------------------
 
@@ -339,7 +334,7 @@ def execute_silver(
     trace.set_input(input_files=input_files, sttm_path=sttm_path)
 
     inspect_tool, ingestion_tool = _make_silver_tools(input_files, sttm_path, run_id)
-    llm = _make_llm()
+    llm = make_llm()
 
     print(f"[SILVER] Running autonomous ReAct agent ({LLM_PROVIDER})")
     agent = create_agent(llm, [inspect_tool, ingestion_tool], system_prompt=SILVER_AGENT_PROMPT)

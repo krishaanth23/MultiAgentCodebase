@@ -15,12 +15,9 @@ Usage in any agent::
 
 import json
 import time
-from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
-
-TRACES_DIR = Path("data/traces")
-TRACES_DIR.mkdir(parents=True, exist_ok=True)
+from core.config import TRACES_DIR
 
 
 class AgentTrace:

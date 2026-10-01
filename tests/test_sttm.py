@@ -38,20 +38,36 @@ GOLD_ROW = {
 }
 
 
-def _mock_agent(sttm_rows: list[dict], context_tool=None):
-    """Return a fake create_agent that optionally calls the context tool then returns STTM rows."""
+def _mock_agent(tool_index: int):
+    """Return a fake create_agent whose agent calls the REAL generation tool at
+    `tool_index` in `tools` (1=bronze, 2=silver, 3=gold -- _make_sttm_tools always
+    returns [inspect, bronze, silver, gold] in that fixed order). This exercises
+    the tool's actual scratchpad-populating side effect, exactly like the live
+    ReAct agent would -- a fabricated final message alone doesn't save an STTM
+    CSV or populate scratchpad["sttm_path"], since that save happens inside the
+    tool itself.
+
+    Callers must also patch agents.sttm_generator.make_llm, since the generation
+    tool makes its OWN separate inner LLM call (distinct from the outer agent's
+    LLM) to actually generate the STTM rows -- see _fake_llm_returning.
+    """
     def fake_create_agent(llm, tools, **kwargs):
         mock_agent = MagicMock()
         def invoke(inputs):
-            messages = []
-            if context_tool is not None:
-                tool_result = context_tool.invoke({})
-                messages.append(MagicMock(content=tool_result))
-            messages.append(MagicMock(content=json.dumps(sttm_rows)))
-            return {"messages": messages}
+            tool_result = tools[tool_index].invoke({})
+            return {"messages": [MagicMock(content=tool_result)]}
         mock_agent.invoke = invoke
         return mock_agent
     return fake_create_agent
+
+
+def _fake_llm_returning(rows: list[dict]):
+    """A minimal fake LLM whose .invoke() returns a JSON array response, for
+    patching agents.sttm_generator.make_llm -- the generation tools' own inner
+    LLM call that actually produces the STTM rows."""
+    fake_llm = MagicMock()
+    fake_llm.invoke.return_value = MagicMock(content=json.dumps(rows))
+    return fake_llm
 
 
 # ---------------------------------------------------------------------------
@@ -155,11 +171,12 @@ class TestGenerateBronzeSttm:
         p = tmp_path / "profile.json"
         p.write_text(json.dumps(profile))
 
-        with patch("agents.sttm_generator.create_agent", side_effect=_mock_agent([BRONZE_ROW])), \
+        with patch("agents.sttm_generator.create_agent", side_effect=_mock_agent(tool_index=1)), \
+             patch("agents.sttm_generator.make_llm", return_value=_fake_llm_returning([BRONZE_ROW])), \
              patch("agents.sttm_generator.STTM_DIR", tmp_path), \
              patch("agents.sttm_generator.AuditLogger"):
             path = generate_bronze_sttm(
-                str(p), "Analyse sales", "run-b1",
+                str(p), "run-b1",
                 task_description="Generate Bronze STTM for run-b1.",
             )
 
@@ -184,7 +201,7 @@ class TestGenerateBronzeSttm:
         with patch("agents.sttm_generator.create_agent", side_effect=fake_create_agent), \
              patch("agents.sttm_generator.STTM_DIR", tmp_path), \
              patch("agents.sttm_generator.AuditLogger"):
-            generate_bronze_sttm(str(p), "intent", "run-b2",
+            generate_bronze_sttm(str(p), "run-b2",
                                   task_description="Generate Bronze STTM.")
 
         assert "Bronze" in captured["system_prompt"]
@@ -201,11 +218,12 @@ class TestGenerateSilverSttm:
         sttm_csv = tmp_path / "bronze_sttm.csv"
         pd.DataFrame({"target_column": ["id", "val"]}).to_csv(str(sttm_csv), index=False)
 
-        with patch("agents.sttm_generator.create_agent", side_effect=_mock_agent([SILVER_ROW])), \
+        with patch("agents.sttm_generator.create_agent", side_effect=_mock_agent(tool_index=2)), \
+             patch("agents.sttm_generator.make_llm", return_value=_fake_llm_returning([SILVER_ROW])), \
              patch("agents.sttm_generator.STTM_DIR", tmp_path), \
              patch("agents.sttm_generator.AuditLogger"):
             path = generate_silver_sttm(
-                [str(parquet)], str(sttm_csv), "intent", "run-s1",
+                [str(parquet)], str(sttm_csv), "run-s1",
                 task_description="Generate Silver STTM for run-s1.",
             )
 
@@ -225,7 +243,8 @@ class TestGenerateGoldSttm:
         sttm_csv = tmp_path / "silver_sttm.csv"
         pd.DataFrame({"target_column": ["revenue", "region"]}).to_csv(str(sttm_csv), index=False)
 
-        with patch("agents.sttm_generator.create_agent", side_effect=_mock_agent([GOLD_ROW])), \
+        with patch("agents.sttm_generator.create_agent", side_effect=_mock_agent(tool_index=3)), \
+             patch("agents.sttm_generator.make_llm", return_value=_fake_llm_returning([GOLD_ROW])), \
              patch("agents.sttm_generator.STTM_DIR", tmp_path), \
              patch("agents.sttm_generator.AuditLogger"):
             path = generate_gold_sttm(
